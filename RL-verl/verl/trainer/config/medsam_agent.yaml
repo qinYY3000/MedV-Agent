@@ -1,0 +1,89 @@
+defaults:
+  - ppo_trainer
+  - _self_
+
+# override with multi-task agent specific configs
+
+data:
+  train_files: "data/busi_parquet/busi_train.parquet"
+  val_files: ["data/busi_parquet/busi_val.parquet"]
+  train_batch_size: 8
+  max_prompt_length: 4096
+  max_response_length: 8192
+  filter_overlong_prompts: False
+  return_raw_chat: True
+  return_full_prompt: True
+  shuffle: True
+  seed: 42
+
+algorithm:
+  adv_estimator: grpo
+  kl_ctrl:
+    kl_coef: 0.0
+
+actor_rollout_ref:
+  model:
+    path: "Qwen/Qwen3-VL-8B-Instruct"
+    use_remove_padding: True
+    use_fused_kernels: True
+    trust_remote_code: True
+  actor:
+    strategy: fsdp
+    ppo_mini_batch_size: 8
+    ppo_micro_batch_size_per_gpu: 1
+    use_dynamic_bsz: False
+    optim:
+      lr: 1e-6
+      lr_warmup_steps_ratio: 0.1
+    fsdp_config:
+      param_offload: True
+      optimizer_offload: True
+      model_dtype: bf16
+    entropy_coeff: 0.0
+    use_kl_loss: False
+    kl_loss_coef: 0.0
+    kl_loss_type: "low_var_kl"
+    checkpoint:
+      save_contents: ["model", "hf_model", "optimizer", "extra"]
+    ulysses_sequence_parallel_size: 1
+  rollout:
+    name: sglang
+    mode: async
+    temperature: 1.0
+    top_p: 0.99
+    top_k: -1
+    n: 8
+    max_num_batched_tokens: 32768
+    gpu_memory_utilization: 0.8
+    enforce_eager: True
+    free_cache_engine: True
+    enable_chunked_prefill: True
+    tensor_model_parallel_size: 1
+    log_prob_micro_batch_size_per_gpu: 1
+    multi_turn:
+      enable: True
+      max_assistant_turns: 7
+      max_user_turns: 7
+      max_parallel_calls: 1
+      tool_config_path: "recipe/medsam_agent/configs/multi_task_tools_config.yaml"
+  ref:
+    strategy: fsdp
+    fsdp_config:
+      param_offload: True
+    log_prob_micro_batch_size_per_gpu: 1
+
+trainer:
+  critic_warmup: 0
+  val_before_train: False
+
+custom_reward_function:
+  path: "recipe/medsam_agent/cpr_reward.py"
+  name: "compute_score"
+
+custom_dataset:
+  path: "recipe/medsam_agent/multi_task_dataset.py"
+  name: "MultiTaskDataset"
+
+agent_loop:
+  path: "recipe/medsam_agent/multi_task_agent_loop.py"
+  name: "MultiTaskAgentLoop"

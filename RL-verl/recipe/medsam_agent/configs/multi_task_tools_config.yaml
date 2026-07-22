@@ -1,0 +1,140 @@
+# 多任务视觉 Agent 统一工具配置
+# 包含: 检测(detect) + 分类(classify) + 分割(add_bbox/add_point/stop_action)
+
+tools:
+  # ====== 检测工具 ======
+  - class_name: "verl.tools.detection_tool.DetectTool"
+    config:
+      num_workers: 16
+      rate_limit: 32
+      timeout: 60
+      type: native
+      api_url: "http://localhost:8266"
+      max_retries: 3
+      retry_delay: 1.0
+    tool_schema:
+      type: "function"
+      function:
+        name: "detect"
+        description: "Detect all instances of the target object in the image. Returns bounding boxes with confidence scores."
+        parameters:
+          type: "object"
+          properties:
+            target:
+              type: "string"
+              description: "Description of the target to detect, e.g. 'breast tumor'"
+            threshold:
+              type: "number"
+              description: "Confidence threshold (0-1), default 0.25"
+              default: 0.25
+          required: ["target"]
+
+  # ====== 分类工具 ======
+  - class_name: "verl.tools.classification_tool.ClassifyTool"
+    config:
+      num_workers: 16
+      rate_limit: 32
+      timeout: 30
+      type: native
+      api_url: "http://localhost:8267"
+      max_retries: 3
+      retry_delay: 1.0
+    tool_schema:
+      type: "function"
+      function:
+        name: "classify"
+        description: "Classify the image or a specific region. Returns label (benign/malignant/normal) and confidence."
+        parameters:
+          type: "object"
+          properties:
+            question:
+              type: "string"
+              description: "Classification question, e.g. 'Is this tumor benign or malignant?'"
+            region:
+              type: "array"
+              items:
+                type: "integer"
+              minItems: 4
+              maxItems: 4
+              description: "Optional region bbox [x1, y1, x2, y2] in 0-999. If omitted, classifies whole image."
+          required: ["question"]
+
+  # ====== 分割工具 (复用 MedSAM2) ======
+  - class_name: "verl.tools.medsam_unified_point_tools.AddBboxTool"
+    config:
+      num_workers: 32
+      rate_limit: 64
+      timeout: 120
+      type: native
+      api_url: "http://localhost:8265"
+      max_retries: 3
+      retry_delay: 1.0
+      model_type: "medsam2"
+    tool_schema:
+      type: "function"
+      function:
+        name: "add_bbox"
+        description: "Add a bounding box to initialize or refine the segmentation. The box should roughly cover the target region."
+        parameters:
+          type: "object"
+          properties:
+            bbox_2d:
+              type: "array"
+              items:
+                type: "integer"
+              minItems: 4
+              maxItems: 4
+              description: "2D bounding box [x1, y1, x2, y2] in 0-999"
+          required: ["bbox_2d"]
+
+  - class_name: "verl.tools.medsam_unified_point_tools.AddPointTool"
+    config:
+      num_workers: 32
+      rate_limit: 64
+      timeout: 120
+      type: native
+      api_url: "http://localhost:8265"
+      max_retries: 3
+      retry_delay: 1.0
+      model_type: "medsam2"
+    tool_schema:
+      type: "function"
+      function:
+        name: "add_point"
+        description: "Add a point to refine the mask (positive to include areas, negative to exclude areas)."
+        parameters:
+          type: "object"
+          properties:
+            point_2d:
+              type: "array"
+              items:
+                type: "integer"
+              minItems: 2
+              maxItems: 2
+              description: "2D coordinate [x, y] in 0-999"
+            point_type:
+              type: "string"
+              enum: ["positive", "negative"]
+              description: "'positive' to expand mask, 'negative' to refine mask"
+          required: ["point_2d", "point_type"]
+
+  # ====== 停止工具 ======
+  - class_name: "verl.tools.medsam_unified_point_tools.StopActionTool"
+    config:
+      num_workers: 32
+      rate_limit: 64
+      timeout: 120
+      type: native
+      api_url: "http://localhost:8265"
+      max_retries: 3
+      retry_delay: 1.0
+      model_type: "medsam2"
+    tool_schema:
+      type: "function"
+      function:
+        name: "stop_action"
+        description: "Signal that the task is complete. Call this when the analysis is finished."
+        parameters:
+          type: "object"
+          properties: {}
+          required: []
