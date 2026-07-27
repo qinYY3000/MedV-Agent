@@ -1,7 +1,8 @@
 #!/bin/bash
 set -euo pipefail
+export HF_ENDPOINT=https://hf-mirror.com
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-
+python3 -m pip install "yapf,scikit-image,supervision,pycocotools,addict" -q
 # === Grounding DINO 本地模型配置 ===
 # 下载方式:
 #   1. git clone https://github.com/IDEA-Research/GroundingDINO.git (放在 SCRIPT_DIR 下)
@@ -22,5 +23,10 @@ export GROUNDING_DINO_HOME
 export GROUNDING_DINO_CONFIG
 export GROUNDING_DINO_CHECKPOINT
 export PORT
+
+# bert-base-uncased 本地路径 (离线加载, 避免 HuggingFace 下载超时)
+export BERT_MODEL_PATH="${BERT_MODEL_PATH:-$SCRIPT_DIR/bert-base-uncased}"
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
 
 python3 "$SCRIPT_DIR/detection_api.py"

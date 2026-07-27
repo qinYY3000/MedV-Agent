@@ -10,3 +10,16 @@ __pycache__/
 *.sqlite3
 *.log
 */__pycache__/
+.idea/.gitignore
+.idea/MedSAM-Agent.iml
+.idea/modules.xml
+.idea/vcs.xml
+.idea/inspectionProfiles/profiles_settings.xml
+.idea/inspectionProfiles/Project_Default.xml
+.vscode/settings.json
+assets/*
+data/covid-19/metadata.csv
+data/datasets/*
+data/sft_data/eval_data.json
+data/sft_data/medsam_agent_sft.json
+docs/*

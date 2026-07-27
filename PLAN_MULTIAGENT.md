@@ -85,6 +85,7 @@ Agent (Qwen3-VL-8B)
 
 ```bash
 # 1. Grounding DINO
+cd MedSAM-Agent
 git clone https://github.com/IDEA-Research/GroundingDINO.git RL-verl/api_server/GroundingDINO
 wget -P RL-verl/api_server/ https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth
 pip install -e RL-verl/api_server/GroundingDINO
@@ -94,13 +95,15 @@ modelscope download --model microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16
 pip install open-clip-torch==2.27.0
 
 # 3. IMISNet
-modelscope download --model 1Junlong/IMIS-Net IMISNet-B.pth --local_dir models/
+wget -P models/ https://huggingface.co/1Junlong/IMIS-Net/resolve/main/IMISNet-B.pth?download=true
 
 # 4. CLIP tokenizer (IMISNet 依赖)
 modelscope download --model openai-mirror/clip-vit-base-patch32 --local_dir models/clip-vit-base-patch32
 
 # 5. BERT tokenizer (Grounding DINO 依赖)
-HF_ENDPOINT=https://hf-mirror.com python -c "from transformers import BertModel; BertModel.from_pretrained('bert-base-uncased')"
+modelscope download --model google-bert/bert-base-uncased --local_dir RL-verl/api_server/bert-base-uncased
+
+modelscope download --model Qwen/Qwen3.5-4B --local_dir /mnt/workspace/Qwen3.5-4B
 ```
 
 ### Phase 1: 数据预处理
@@ -158,6 +161,7 @@ python data/combine_parquet.py --datasets-dir data/datasets --output data/datase
 
 ```bash
 # 终端1: 分割 API (IMISNet)
+export HF_ENDPOINT=https://hf-mirror.com
 pip install hydra-core==1.3.2 timm         pip install monai
 bash RL-verl/api_server/run_api.sh              # :8265
 
@@ -174,33 +178,6 @@ curl http://localhost:8265/health
 curl http://localhost:8266/health
 curl http://localhost:8267/health
 
-# 1. 修复 openai 版本 (解决 responses 模块缺失)
-pip install openai==1.51.0
-
-# 2. 修复 verl 的 vllm lora 导入
-# 找到实际的 lora 模块位置
-python -c "
-import vllm.lora
-import os
-lora_dir = os.path.dirname(vllm.lora.__file__)
-print('vllm.lora dir:', lora_dir)
-for f in os.listdir(lora_dir):
-    print(' ', f)
-"
-
-# 3. 根据输出修复 verl/utils/vllm/utils.py
-# 如果有 vllm/lora/lora.py, 改 import 路径
-sed -i 's/from vllm.lora.models import LoRAModel/try:\n    from vllm.lora.models import LoRAModel\nexcept ImportError:\n    from vllm.lora.lora import LoRAModel as LoRAModel/' \
-    /mnt/workspace/MedSAM-Agent/RL-verl/verl/utils/vllm/utils.py
-
-# 4. 验证 vllm 能正常 import
-python -c "from vllm import LLM, SamplingParams; print('vllm OK')"
-
-# 5. 切回 vllm
-sed -i 's/rollout.name=hf/rollout.name=vllm/' /mnt/workspace/MedSAM-Agent/RL-verl/recipe/medsam_agent/run_multi_task.sh
-
-# 6. 重跑
-bash RL-verl/recipe/medsam_agent/run_multi_task.sh
 ```
 
 ### Phase 2: SFT 训练
@@ -220,11 +197,12 @@ cd /mnt/workspace/LlamaFactory && pip install -e ".[torch,metrics]"
 # 1. 确保 PyTorch ROCm 版本正确
 pip uninstall torch torchvision torchaudio -y
 pip install torch==2.7.0+rocm6.2.4 torchvision==0.22.0+rocm6.2.4 torchaudio==2.7.0+rocm6.2.4     --index-url https://download.pytorch.org/whl/rocm6.2.4
+pip install torch==2.10.0+rocm7.0 torchvision==0.25.0+rocm7.0 torchaudio==2.10.0+rocm7.0 --index-url https://download.pytorch.org/whl/rocm7.0
 
 # 2. 首次训练 (建议先用 max_samples: 2000 快速验证)
 cd /mnt/workspace/LlamaFactory
 CUDA_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0 \
-llamafactory-cli train /mnt/workspace/MedSAM-Agent/data/sft_data/sft_train_lora.yaml
+llamafactory-cli train /mnt/workspace/MedSAM-Agent/data/sft_data/sft_train_4b.yaml
 
 ```
 
@@ -245,18 +223,18 @@ llamafactory-cli train /mnt/workspace/MedSAM-Agent/data/sft_data/sft_train_lora.
 
 ```bash
 llamafactory-cli export \
-    --model_name_or_path /mnt/workspace/Qwen3-VL-8B-Instruct \
-    --adapter_name_or_path /mnt/workspace/LlamaFactory/saves/qwen3-vl-8b/lora/sft \
+    --model_name_or_path /mnt/workspace/Qwen3.5-4B \
+    --adapter_name_or_path /mnt/workspace/LlamaFactory/saves/qwen3.5-4b/lora/sft \
     --template qwen3_vl_nothink \
     --finetuning_type lora \
-    --export_dir /mnt/workspace/LlamaFactory/saves/qwen3_vl_sft_merged
+    --export_dir /mnt/workspace/LlamaFactory/saves/qwen3.5_sft_merged
 ```
 
 #### Step 2.4: SFT 评估
 
 ```bash
 python data/eval_sft.py \
-    --model-path /mnt/workspace/LlamaFactory/saves/qwen3_vl_sft_merged \
+    --model-path /mnt/workspace/LlamaFactory/saves/qwen3.5_sft_merged \
     --source busi data/Dataset_BUSI_with_GT \
     --source kvasir data/kvasir-seg \
     --source covid data/covid-19 \
@@ -272,8 +250,8 @@ python data/eval_sft.py \
 **上传模型到 ModelScope**:
 ```bash
 # 将 SFT 合并后的模型上传到 ModelScope
-modelscope upload ScholarChen20/Qwen3-VL-8B-Instruct \
-    /mnt/workspace/LlamaFactory/saves/qwen3_vl_sft_merged \
+modelscope upload ScholarChen20/Qwen3.5-4B \
+    /mnt/workspace/LlamaFactory/saves/qwen3.5_sft_merged \
     --token ms-7df9fd49-9a59-495d-bf50-f2922001f367xxx112g
 ```
 
@@ -292,23 +270,6 @@ curl http://localhost:8267/health  # 分类
 ```bash
 cd RL-verl
 pip install -e ".[sglang]" --no-build-isolation
-
-# --- AMD ROCm 兼容修复 (vllm 0.20+rocm 版本) ---
-
-# 1. 修复 openai 版本不兼容
-pip install openai==1.51.0
-
-# 2. 修复 vllm.lora 模块路径 (vLLM 0.20 改名 lora/models.py → lora/lora_model.py)
-cd RL-verl
-grep -rl "vllm.lora.models" --include="*.py" | xargs sed -i 's/vllm\.lora\.models/vllm.lora.lora_model/g'
-
-# 3. 修复 transformers 5.x API 变更 (AutoModelForVision2Seq → AutoModelForImageTextToText)
-grep -rl "AutoModelForVision2Seq" --include="*.py" | xargs sed -i 's/AutoModelForVision2Seq/AutoModelForImageTextToText/g'
-
-# 4. 验证修复
-python -c "from vllm.lora.lora_model import LoRAModel; print('vllm LoRA OK')"
-python -c "from vllm import LLM, SamplingParams; print('vllm OK')"
-
 ```
 
 > **注**: 以上修复针对镜像环境 `Ubuntu 22.04 + ROCm 7.2.1 + vLLM 0.20.1+rocm721`。
@@ -316,6 +277,10 @@ python -c "from vllm import LLM, SamplingParams; print('vllm OK')"
 #### Step 3.3: 启动 RL 训练
 
 ```bash
+git clone https://github.com/Dao-AILab/flash-attention.git
+cd flash-attention
+MAX_JOBS=4 python setup.py install
+
 cd /mnt/workspace/MedSAM-Agent
 bash RL-verl/recipe/medsam_agent/run_multi_task.sh
 ```

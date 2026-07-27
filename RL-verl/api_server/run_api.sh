@@ -1,7 +1,9 @@
 #!/bin/bash
 
 set -euo pipefail
-
+export HF_ENDPOINT=https://hf-mirror.com
+python3 -m pip install "hydra-core==1.3.2,timm" -q
+python3 -m pip install "monai" -q
 MODEL_TYPE=${MODEL_TYPE:-imisnet}  # imisnet | medsam2
 PORT=${PORT:-8265}
 

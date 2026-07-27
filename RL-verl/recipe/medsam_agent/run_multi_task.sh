@@ -5,14 +5,15 @@ set -x
 # 多任务 VLM Agent RL 训练脚本
 # 支持: 分类/检测/分割/复合 四种任务
 # 基于 GRPO 算法, Verl框架
-# 适配单卡 192GB 显存
+#
+# 显存适配: 192GB AMD MI300X (ROCm)
+# 策略: vllm rollout + FSDP (无需 offload)
 # ============================================================
 
 # --- 模型配置 ---
-# 注意: RL 从 SFT checkpoint 开始, 不是原始 Qwen 基座
-REF_MODEL_PATH=${REF_MODEL_PATH:-"/mnt/workspace/LlamaFactory/saves/qwen3_vl_sft_merged"}
+REF_MODEL_PATH=${REF_MODEL_PATH:-"/mnt/workspace/LlamaFactory/saves/qwen3.5_sft_merged"}
 
-# --- 数据集路径 (默认用采样子集, 全量改为 combined) ---
+# --- 数据集路径 ---
 DATASET_TRAIN=${DATASET_TRAIN:-"data/datasets/subset/train.parquet"}
 DATASET_VAL=${DATASET_VAL:-"data/datasets/subset/val.parquet"}
 
@@ -21,13 +22,20 @@ SAVE_CHECKPOINT_DIR=${SAVE_CHECKPOINT_DIR:-"./output/verl_multi_task_checkpoints
 PROJECT_NAME="multi_task_agent"
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-"multi_task_busi_test"}
 
-# --- 训练超参 (单卡适配, 采样子集优化) ---
+# --- 训练超参 (192GB 显存, 宽裕配置) ---
 ACTOR_LR=${ACTOR_LR:-1e-6}
-SAVE_FREQ=${SAVE_FREQ:-50}            # 50步保存一次 (子集模式)
-TOTAL_EPOCHS=${TOTAL_EPOCHS:-3}       # 3 epochs
+SAVE_FREQ=${SAVE_FREQ:-50}
+TOTAL_EPOCHS=${TOTAL_EPOCHS:-3}
 TRAIN_BATCH=${TRAIN_BATCH:-4}
 N_GPU=${N_GPU:-1}
-ROLLOUT_N=${ROLLOUT_N:-2}             # 2条轨迹 (降低显存和时间)
+ROLLOUT_N=${ROLLOUT_N:-4}             # 4条轨迹 (显存够)
+MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-16384}
+
+# --- 显存优化开关 (192GB 默认关闭, 不需要 offload) ---
+PARAM_OFFLOAD=${PARAM_OFFLOAD:-False}
+OPTIMIZER_OFFLOAD=${OPTIMIZER_OFFLOAD:-False}
+GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-True}
+GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.6}     # vllm 显存占比
 
 # --- 路径计算 ---
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -43,14 +51,17 @@ MULTI_TASK_DATASET="${RECIPE_DIR}/multi_task_dataset.py"
 MULTI_TASK_AGENT_LOOP="${RECIPE_DIR}/multi_task_agent_loop.py"
 
 echo "============================================"
-echo "Multi-Task Agent RL Training (Single GPU)"
+echo "Multi-Task Agent RL Training (192GB ROCm)"
 echo "============================================"
 echo "Model:      $REF_MODEL_PATH"
 echo "Train data: $DATASET_TRAIN"
 echo "Val data:   $DATASET_VAL"
 echo "Save dir:   $SAVE_CHECKPOINT_DIR"
 echo "GPU count:  $N_GPU"
+echo "Rollout:    vllm"
 echo "Rollout n:  $ROLLOUT_N"
+echo "Batch size: $TRAIN_BATCH"
+echo "Offload:    param=$PARAM_OFFLOAD optimizer=$OPTIMIZER_OFFLOAD"
 echo "============================================"
 
 # --- 启动训练 ---
@@ -59,13 +70,15 @@ export HIP_VISIBLE_DEVICES=0
 export ROCM_PATH=/opt/rocm
 export RAY_DISABLE_DASHBOARD=1
 export RAY_raylet_start_wait_time_s=120
+# 显存碎片优化
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # 清理旧的 ray 进程
 ray stop --force 2>/dev/null
 rm -rf /tmp/ray/*
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     --config-name='medsam_agent' \
     data.train_files=${DATASET_TRAIN} \
-    data.val_files=[${DATASET_VAL}] \
+    "data.val_files=[${DATASET_VAL}]" \
     data.train_batch_size=${TRAIN_BATCH} \
     data.max_prompt_length=4096 \
     data.max_response_length=8192 \
@@ -86,32 +99,33 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.kl_loss_coef=0.0 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0.0 \
-    actor_rollout_ref.actor.checkpoint.save_contents=['model','hf_model','optimizer','extra'] \
+    'actor_rollout_ref.actor.checkpoint.save_contents=[model,hf_model,optimizer,extra]' \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
-    actor_rollout_ref.actor.fsdp_config.param_offload=False \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.actor.fsdp_config.param_offload=${PARAM_OFFLOAD} \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=${OPTIMIZER_OFFLOAD} \
+    actor_rollout_ref.model.enable_gradient_checkpointing=${GRADIENT_CHECKPOINTING} \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-    actor_rollout_ref.rollout.name=hf \
+    actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.mode=async \
     actor_rollout_ref.rollout.n=${ROLLOUT_N} \
-    actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS} \
+    actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEM_UTIL} \
     actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=False \
+    actor_rollout_ref.ref.fsdp_config.param_offload=${PARAM_OFFLOAD} \
     actor_rollout_ref.rollout.multi_turn.enable=True \
-    actor_rollout_ref.rollout.multi_turn.max_assistant_turns=3 \
-    actor_rollout_ref.rollout.max_user_turns=3 \
+    actor_rollout_ref.rollout.multi_turn.max_assistant_turns=5 \
+    actor_rollout_ref.rollout.multi_turn.max_user_turns=5 \
     actor_rollout_ref.rollout.multi_turn.max_parallel_calls=1 \
     actor_rollout_ref.rollout.multi_turn.tool_config_path=${TOOL_CONFIG} \
     custom_reward_function.path=${CPR_REWARD} \
     custom_dataset.path=${MULTI_TASK_DATASET} \
     agent_loop.path=${MULTI_TASK_AGENT_LOOP} \
     trainer.critic_warmup=0 \
-    trainer.logger=['console'] \
+    'trainer.logger=[console]' \
     trainer.val_before_train=False \
     trainer.n_gpus_per_node=${N_GPU} \
     trainer.nnodes=1 \

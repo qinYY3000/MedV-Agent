@@ -35,7 +35,11 @@ use_dn = False
 embed_init_tgt = True
 dn_labelbook_size = 2000
 max_text_len = 256
-text_encoder_type = "bert-base-uncased"
+import os as _os
+text_encoder_type = _os.getenv(
+    "BERT_MODEL_PATH",
+    "/mnt/workspace/MedSAM-Agent/RL-verl/api_server/bert-base-uncased",
+)
 use_text_enhancer = True
 use_fusion_layer = True
 fusion_layer_num = 3

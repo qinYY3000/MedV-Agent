@@ -257,34 +257,58 @@ def scan_abdomen_2d(abd_2d_root: str, dataset_name: str = "abdct",
     # 如果没有 parquet，直接扫描 images 目录
     if not samples:
         images_dir = abd_root / "images"
+        # 已知器官名列表
+        KNOWN_ORGANS = {
+            "liver", "spleen", "kidney", "pancreas", "aorta",
+            "stomach", "gallbladder", "esophagus", "duodenum",
+            "inferior_vena_cava", "right_adrenal_gland", "left_adrenal_gland",
+            "adrenal_gland", "postcava", "gall_bladder", "right_kidney", "left_kidney",
+        }
         if images_dir.exists():
+            # 收集所有 mask 文件，按 base_name 分组
+            from collections import defaultdict
+            mask_map = defaultdict(list)  # base_name → [(organ, mask_path), ...]
+            for mask_file in images_dir.glob("*_mask.png"):
+                fname = mask_file.name
+                # 格式: {base_name}_{organ}_mask.png
+                # 从末尾去掉 "_mask.png", 再尝试匹配器官名
+                stem = fname[:-9]  # 去掉 "_mask.png"
+                for organ in KNOWN_ORGANS:
+                    if stem.endswith(f"_{organ}"):
+                        base_name = stem[:-len(f"_{organ}")]
+                        mask_map[base_name].append((organ, mask_file))
+                        break
+            
+            # 为每个原图 + 每个器官 mask 生成一条样本
             for img_file in sorted(images_dir.glob("*.png")):
                 if "_mask" in img_file.name:
                     continue
-                # 从文件名解析器官名
-                # 格式: abdct__FLARE22_Tr_0001__slice045_liver_mask.png
-                name = img_file.stem
-                parts = name.split("_")
-                organ = "organ"
-                for p in parts:
-                    if p in ["liver", "spleen", "kidney", "pancreas", "aorta",
-                             "stomach", "gallbladder", "esophagus", "duodenum"]:
-                        organ = p
-                        break
-                # 找对应的 mask
-                mask_file = images_dir / f"{name}_{organ}_mask.png"
-                if not mask_file.exists():
-                    # 尝试其他 mask 命名
-                    masks = list(images_dir.glob(f"{name}*mask*.png"))
-                    mask_file = masks[0] if masks else None
-                bbox = _bbox_from_mask(str(mask_file)) if mask_file else None
-                samples.append({
-                    "image_path": str(img_file.resolve()),
-                    "mask_path": str(mask_file.resolve()) if mask_file else None,
-                    "bbox": bbox,
-                    "label": organ,
-                    "sample_id": f"{dataset_name}::{name}",
-                })
+                base_name = img_file.stem
+                img_path = str(img_file.resolve())
+                
+                # 找到对应的所有器官 masks
+                organ_masks = mask_map.get(base_name, [])
+                
+                if organ_masks:
+                    for organ, mask_file in organ_masks:
+                        mask_path = str(mask_file.resolve())
+                        bbox = _bbox_from_mask(mask_path)
+                        samples.append({
+                            "image_path": img_path,
+                            "mask_path": mask_path,
+                            "bbox": bbox,
+                            "label": organ,
+                            "sample_id": f"{dataset_name}::{base_name}::{organ}",
+                        })
+                else:
+                    # 没有 mask → 只能做分类
+                    samples.append({
+                        "image_path": img_path,
+                        "mask_path": None,
+                        "bbox": None,
+                        "label": "organ",
+                        "sample_id": f"{dataset_name}::{base_name}",
+                    })
 
     print(f"{dataset_name.upper()}: {len(samples)} 2D slices")
     return _split(samples, train_ratio, val_ratio, seed)
@@ -328,6 +352,18 @@ def _split(samples, train_ratio=0.7, val_ratio=0.15, seed=42):
 # ============================================================
 # 2. 轨迹生成函数
 # ============================================================
+
+# 器官标签集合 (CT/MR 多器官数据集的 label)
+ORGAN_LABELS = {
+    "liver", "spleen", "kidney", "pancreas", "aorta",
+    "stomach", "gallbladder", "esophagus", "duodenum",
+    "inferior_vena_cava", "right_adrenal_gland", "left_adrenal_gland",
+    "adrenal_gland", "postcava", "gall_bladder", "right_kidney", "left_kidney",
+}
+
+def is_organ(label):
+    """判断 label 是否是解剖器官 (而非病理/病灶标签)。"""
+    return label in ORGAN_LABELS
 
 def tc(name, args):
     return "<tool_call>\n" + json.dumps({"name": name, "arguments": args}) + "\n</tool_call>"
@@ -375,10 +411,18 @@ Assistant: <tool_call>
 def build_classify(image_path, label):
     # 注意: system prompt 不放在 conversations 里, 而是作为单独的 system 字段
     # LlamaFactory sharegpt 要求第一条消息必须是 human
+    if is_organ(label):
+        prompt = f"<image>What anatomical structure is shown in this region?"
+        question = "What is the anatomical structure?"
+        result = f"The identified structure is {label}."
+    else:
+        prompt = f"<image>Classify this medical image. What is the finding?"
+        question = "What is the diagnosis?"
+        result = f"Classification result: {label} (confidence: 0.92)"
     return [
-        {"from": "human", "value": f"<image>Classify this medical image. What is the finding?"},
-        {"from": "gpt", "value": tc("classify", {"question": "What is the diagnosis?"})},
-        {"from": "human", "value": f"Classification result: {label} (confidence: 0.92)"},
+        {"from": "human", "value": prompt},
+        {"from": "gpt", "value": tc("classify", {"question": question})},
+        {"from": "human", "value": result},
         {"from": "gpt", "value": tc("stop_action", {})},
     ]
 
@@ -387,15 +431,23 @@ def build_detect(image_path, bbox, label):
     if bbox is None:
         return build_classify(image_path, label)
     
+    if is_organ(label):
+        prompt = f"<image>Detect the {label} in this CT/MR image."
+        target = label
+    else:
+        prompt = "<image>Detect all targets in this image."
+        # 用 label 作为检测目标, 而不是硬编码
+        target = label.replace("_", " ") if "_" in label else label
+    
     return [
-        {"from": "human", "value": "<image>Detect all targets in this image."},
-        {"from": "gpt", "value": tc("detect", {"target": "polyp" if label == "polyp" else "breast tumor"})},
+        {"from": "human", "value": prompt},
+        {"from": "gpt", "value": tc("detect", {"target": target})},
         {"from": "human", "value": f"Detected 1 region: bbox={bbox}, score=0.95"},
         {"from": "gpt", "value": tc("stop_action", {})},
     ]
 
 
-def build_segment(image_path, mask_path, max_clicks=2):
+def build_segment(image_path, mask_path, max_clicks=2, label=None):
     """分割轨迹: add_bbox -> add_point -> ... -> stop
     
     注意: 只在第一条 human 消息放 <image> 占位符, 后续轮次不放
@@ -412,8 +464,13 @@ def build_segment(image_path, mask_path, max_clicks=2):
     bbox = [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
     bbox_999 = [int(x*999/w) for x in bbox[:2]] + [int(y*999/h) for y in bbox[2:]]
     
+    if is_organ(label):
+        prompt = f"<image>Segment the {label} in this CT/MR image."
+    else:
+        prompt = "<image>Segment the target in this image."
+    
     msgs = [
-        {"from": "human", "value": "<image>Segment the target in this image."},
+        {"from": "human", "value": prompt},
         {"from": "gpt", "value": tc("add_bbox", {"bbox_2d": bbox_999})},
     ]
     
@@ -454,16 +511,25 @@ def build_composite(image_path, mask_path, label, bbox=None):
     cx, cy = int(np.median(xs)), int(np.median(ys))
     px, py = int(cx*999/w), int(cy*999/h)
     
+    if is_organ(label):
+        prompt = f"<image>Analyze this CT/MR image: detect and segment the {label}."
+        target = label
+        classify_result = f"The segmented region is {label}."
+    else:
+        prompt = "<image>Analyze this image: find all targets, segment them, and classify each one."
+        target = label.replace("_", " ") if "_" in label else label
+        classify_result = f"Classification result: {label} (confidence: 0.92)"
+    
     return [
-        {"from": "human", "value": "<image>Analyze this image: find all targets, segment them, and classify each one."},
-        {"from": "gpt", "value": tc("detect", {"target": "polyp" if label == "polyp" else "breast tumor"})},
+        {"from": "human", "value": prompt},
+        {"from": "gpt", "value": tc("detect", {"target": target})},
         {"from": "human", "value": f"Detected 1 region: bbox={bbox_999}, score=0.95"},
         {"from": "gpt", "value": tc("add_bbox", {"bbox_2d": bbox_999})},
         {"from": "human", "value": "Mask initialized. What is your next action?"},
         {"from": "gpt", "value": tc("add_point", {"point_2d": [px, py], "point_type": "positive"})},
         {"from": "human", "value": "Mask refined. What is your next action?"},
-        {"from": "gpt", "value": tc("classify", {"question": "What is the classification?"})},
-        {"from": "human", "value": f"Classification result: {label} (confidence: 0.92)"},
+        {"from": "gpt", "value": tc("classify", {"question": "What is the anatomical structure?" if is_organ(label) else "What is the classification?"})},
+        {"from": "human", "value": classify_result},
         {"from": "gpt", "value": tc("stop_action", {})},
     ]
 
@@ -530,7 +596,7 @@ def generate_sharegpt(samples, output_dir, dataset_name, max_clicks=2,
                 elif task_type == "detect":
                     conv = build_detect(img_path, bbox, label)
                 elif task_type == "segment":
-                    conv = build_segment(img_path, mask_path, max_clicks)
+                    conv = build_segment(img_path, mask_path, max_clicks, label)
                 elif task_type == "composite":
                     conv = build_composite(img_path, mask_path, label, bbox)
                 else:
@@ -694,12 +760,23 @@ def main():
         counts = ", ".join([f"{t}: {c}" for t, c in task_counts.items()])
         print(f"  → Added {len(entries)} entries ({counts})")
     
+    # Shuffle 打散所有数据 (避免 max_samples 只取到前几个数据集)
+    json_path = output_dir / "medsam_agent_sft.json"
+    if json_path.exists():
+        with open(json_path) as f:
+            all_data = json.load(f)
+        rng = np.random.RandomState(args.seed)
+        rng.shuffle(all_data)
+        with open(json_path, "w") as f:
+            json.dump(all_data, f, ensure_ascii=False)
+        print(f"  Shuffled {len(all_data)} entries (seed={args.seed})")
+    
     total = 0
-    if (output_dir / "medsam_agent_sft.json").exists():
-        with open(output_dir / "medsam_agent_sft.json") as f:
+    if json_path.exists():
+        with open(json_path) as f:
             total = len(json.load(f))
     print(f"\nTotal SFT dataset: {total} entries")
-    print(f"Dataset: {output_dir / 'medsam_agent_sft.json'}")
+    print(f"Dataset: {json_path}")
     
     # 写 dataset_info.json
     info_path = output_dir / "dataset_info.json"

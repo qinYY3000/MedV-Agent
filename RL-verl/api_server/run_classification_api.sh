@@ -1,5 +1,7 @@
 #!/bin/bash
 set -euo pipefail
+export HF_ENDPOINT=https://hf-mirror.com
+python3 -m pip install "open-clip-torch==2.27.0" -q
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # === BioMedCLIP 本地模型配置 ===
