@@ -85,7 +85,6 @@ Agent (Qwen3-VL-8B)
 
 ```bash
 # 1. Grounding DINO
-cd MedSAM-Agent
 git clone https://github.com/IDEA-Research/GroundingDINO.git RL-verl/api_server/GroundingDINO
 wget -P RL-verl/api_server/ https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth
 pip install -e RL-verl/api_server/GroundingDINO
@@ -95,13 +94,13 @@ modelscope download --model microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16
 pip install open-clip-torch==2.27.0
 
 # 3. IMISNet
-wget -P models/ https://huggingface.co/1Junlong/IMIS-Net/resolve/main/IMISNet-B.pth?download=true
+modelscope download --model 1Junlong/IMIS-Net IMISNet-B.pth --local_dir models/
 
 # 4. CLIP tokenizer (IMISNet 依赖)
 modelscope download --model openai-mirror/clip-vit-base-patch32 --local_dir models/clip-vit-base-patch32
 
 # 5. BERT tokenizer (Grounding DINO 依赖)
-modelscope download --model google-bert/bert-base-uncased --local_dir RL-verl/api_server/bert-base-uncased
+HF_ENDPOINT=https://hf-mirror.com python -c "from transformers import BertModel; BertModel.from_pretrained('bert-base-uncased')"
 
 modelscope download --model Qwen/Qwen3.5-4B --local_dir /mnt/workspace/Qwen3.5-4B
 ```
@@ -117,6 +116,7 @@ python data/extract_3d_slices.py --input-dir data/datasets/abdct --output-dir da
 python data/extract_3d_slices.py --input-dir data/datasets/abdmr --output-dir data/datasets/abdmr_2d --slices-per-volume 5
 
 # 生成 sharegpt SFT 数据
+cd /mnt/workspace/MedSAM-Agent
 python data/prepare_sharegpt.py \
     --source busi data/Dataset_BUSI_with_GT \
     --source kvasir data/kvasir-seg \
@@ -195,12 +195,14 @@ cd /mnt/workspace/LlamaFactory && pip install -e ".[torch,metrics]"
 
 ```bash
 # 1. 确保 PyTorch ROCm 版本正确
-pip uninstall torch torchvision torchaudio -y
-pip install torch==2.7.0+rocm6.2.4 torchvision==0.22.0+rocm6.2.4 torchaudio==2.7.0+rocm6.2.4     --index-url https://download.pytorch.org/whl/rocm6.2.4
 pip install torch==2.10.0+rocm7.0 torchvision==0.25.0+rocm7.0 torchaudio==2.10.0+rocm7.0 --index-url https://download.pytorch.org/whl/rocm7.0
 
 # 2. 首次训练 (建议先用 max_samples: 2000 快速验证)
 cd /mnt/workspace/LlamaFactory
+export MIOPEN_ENABLED=0
+export MIOPEN_DEBUG_CONV_FFT=0
+export MIOPEN_DEBUG_CONV_DIRECT=0
+export MIOPEN_DEBUG_CONV_WINOGRAD=0
 CUDA_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0 \
 llamafactory-cli train /mnt/workspace/MedSAM-Agent/data/sft_data/sft_train_4b.yaml
 
@@ -233,15 +235,12 @@ llamafactory-cli export \
 #### Step 2.4: SFT 评估
 
 ```bash
-python data/eval_sft.py \
+cd /mnt/workspace/MedSAM-Agent && python data/eval_sft.py \
     --model-path /mnt/workspace/LlamaFactory/saves/qwen3.5_sft_merged \
-    --source busi data/Dataset_BUSI_with_GT \
-    --source kvasir data/kvasir-seg \
-    --source covid data/covid-19 \
     --source tn3k data/tn3k \
     --source abdct data/datasets/abdct_2d \
     --source abdmr data/datasets/abdmr_2d \
-    --output data/sft_data/eval_results.json \
+    --output data/sft_data/eval_results_covid.json \
     --num-samples 5
 ```
 

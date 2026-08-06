@@ -130,21 +130,6 @@ def scan_kvasir(kvasir_root: str, train_ratio=0.7, val_ratio=0.15, seed=42) -> D
     return _split(samples, train_ratio, val_ratio, seed)
 
 
-def _split(samples, train_ratio, val_ratio, seed):
-    rng = np.random.RandomState(seed)
-    indices = list(range(len(samples)))
-    rng.shuffle(indices)
-    n = len(indices)
-    n_train = int(n * train_ratio)
-    n_val = int(n * val_ratio)
-    
-    return {
-        "train": [samples[i] for i in indices[:n_train]],
-        "val":   [samples[i] for i in indices[n_train:n_train+n_val]],
-        "test":  [samples[i] for i in indices[n_train+n_val:]],
-    }
-
-
 # ============================================================
 # COVID-19 胸部 X-ray (4类分类 + 肺部分割)
 # ============================================================
@@ -539,7 +524,19 @@ def build_composite(image_path, mask_path, label, bbox=None):
 # ============================================================
 
 def generate_sharegpt(samples, output_dir, dataset_name, max_clicks=2,
-                      server_root=None, local_prefix=None):
+                      server_root=None, local_prefix=None,
+                      max_per_task: Optional[int] = None,
+                      per_modality: int = 0):
+    """从样本列表生成 sharegpt 格式，支持按模态均衡下采样。
+
+    Parameters
+    ----------
+    max_per_task : int or None
+        每种 task_type 最多保留多少条。None = 不限制。
+    per_modality : int
+        每种 modality（按 sample_id 前缀分组）每种 task 至少保留多少条。
+        0 = 不启用均衡采样。
+    """
     """从样本列表生成 sharegpt 格式数据集。
     
     sharegpt 格式要求:
@@ -628,7 +625,67 @@ def generate_sharegpt(samples, output_dir, dataset_name, max_clicks=2,
             except Exception as e:
                 print(f"    Error {task_type} {sid}: {e}")
     
+    # ---- 按模态均衡下采样 ----
+    if (max_per_task is not None and max_per_task > 0) or per_modality > 0:
+        n_before = len(entries)
+        entries = _stratified_sample(
+            entries, max_per_task=(max_per_task if max_per_task and max_per_task > 0 else None),
+            per_modality=per_modality, seed=42,
+        )
+        # 统计各 task 的数量
+        tc_before = defaultdict(int)
+        for e in entries if n_before == len(entries) else []:
+            pass
+        tc_after = defaultdict(int)
+        for e in entries:
+            tc_after[e.get("_task_type", "?")] += 1
+        print(f"    Stratified: {n_before} → {len(entries)}  "
+              f"({', '.join(f'{k}: {v}' for k, v in sorted(tc_after.items()))})")
     return entries
+
+
+def _stratified_sample(entries: list, max_per_task: Optional[int] = None,
+                       per_modality: int = 0, seed: int = 42) -> list:
+    """按 task_type × modality 分组后均衡下采样。
+
+    对于每个 task_type，从各 modality 等量采样（至少 per_modality 条），
+    总条数不超过 max_per_task。
+    """
+    if max_per_task is None and per_modality <= 0:
+        return entries
+
+    # 分组: {task_type: {modality: [indices]}}
+    rng = np.random.RandomState(seed)
+    grouped: dict = defaultdict(lambda: defaultdict(list))
+    for i, e in enumerate(entries):
+        task = e.get("_task_type", "unknown")
+        sid = e.get("_sample_id", "")
+        # modality = dataset prefix (e.g. "busi", "covid", "abdct")
+        modality = sid.split("::")[0] if "::" in sid else "default"
+        grouped[task][modality].append(i)
+
+    sampled = set()
+    for task, mods in grouped.items():
+        modal_keys = sorted(mods.keys())
+        if per_modality > 0:
+            # 每种 modality 取 min(per_modality, 可用数量)
+            per_mod = per_modality
+            for mod in modal_keys:
+                indices = mods[mod]
+                rng.shuffle(indices)
+                sampled.update(indices[:per_mod])
+        else:
+            for mod in modal_keys:
+                indices = mods[mod]
+                sampled.update(indices)
+
+    result = [entries[i] for i in sampled if i < len(entries)]
+    rng.shuffle(result)
+
+    if max_per_task is not None and len(result) > max_per_task:
+        result = result[:max_per_task]
+
+    return result
 
 
 # ============================================================
@@ -679,6 +736,12 @@ def main():
     parser.add_argument("--max-clicks", type=int, default=2,
                         help="Max segment refinement turns")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max-per-task", type=int, default=1200,
+                        help="Max entries per task type (0=no limit). "
+                             "With 4 task types × 1200 ≈ 4800 total. Soft cap.")
+    parser.add_argument("--per-modality", type=int, default=200,
+                        help="Entries per modality per task type. "
+                             "6 modalities × 4 tasks × 200 = 4800 total (approx).")
     args = parser.parse_args()
     
     print("=" * 60)
@@ -733,7 +796,9 @@ def main():
         print(f"\nGenerating {split} ({len(samples)} samples)...")
         entries = generate_sharegpt(
             samples, str(output_dir), f"{split}_", args.max_clicks,
-            server_root=args.server_root, local_prefix=local_prefix
+            server_root=args.server_root, local_prefix=local_prefix,
+            max_per_task=args.max_per_task if args.max_per_task > 0 else None,
+            per_modality=args.per_modality,
         )
         
         out_path = output_dir / f"medsam_agent_sft.json"

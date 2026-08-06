@@ -32,7 +32,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 # 复用 prepare_sharegpt 的数据扫描
-from data.prepare_sharegpt import scan_busi, scan_kvasir
+from data.prepare_sharegpt import (
+    scan_busi, scan_kvasir, scan_covid19, scan_tn3k, scan_abdomen_2d,
+)
 
 
 def parse_tool_call(text: str):
@@ -203,7 +205,16 @@ def main():
             splits = scan_busi(src_root, seed=args.seed)
         elif src_type == "kvasir":
             splits = scan_kvasir(src_root, seed=args.seed)
+        elif src_type == "covid":
+            splits = scan_covid19(src_root, seed=args.seed)
+        elif src_type == "tn3k":
+            splits = scan_tn3k(src_root, seed=args.seed)
+        elif src_type in ("abdct", "abdct_2d"):
+            splits = scan_abdomen_2d(src_root, "abdct", seed=args.seed)
+        elif src_type in ("abdmr", "abdmr_2d"):
+            splits = scan_abdomen_2d(src_root, "abdmr", seed=args.seed)
         else:
+            print(f"  Unknown source type: {src_type}, skip")
             continue
         all_test_samples.extend(splits["test"])
 
