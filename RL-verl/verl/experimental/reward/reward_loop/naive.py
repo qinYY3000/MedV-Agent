@@ -21,6 +21,40 @@ from verl.experimental.reward.reward_loop.base import RewardLoopManagerBase
 from verl.utils.reward_score import default_compute_score
 
 
+def _unwrap_singleton(value):
+    if isinstance(value, np.ndarray) and value.dtype == object:
+        if value.ndim > 0 and value.shape[0] == 1:
+            value = value[0]
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+    if isinstance(value, np.ndarray) and value.size == 1:
+        return value.item()
+    return value
+
+
+def build_reward_extra_info(non_tensor_batch: dict) -> dict:
+    extra_info_value = _unwrap_singleton(non_tensor_batch.get("extra_info", {}))
+    extra_info = dict(extra_info_value) if isinstance(extra_info_value, dict) else {}
+    excluded_keys = {
+        "data_source",
+        "reward_model",
+        "extra_info",
+        "raw_prompt",
+        "multi_modal_data",
+        "multi_modal_inputs",
+        "tools_kwargs",
+    }
+    for key, value in non_tensor_batch.items():
+        if key in excluded_keys or key.startswith("__"):
+            continue
+        extra_info[key] = _unwrap_singleton(value)
+
+    num_turns = non_tensor_batch.get("__num_turns__")
+    if num_turns is not None:
+        extra_info["num_turns"] = _unwrap_singleton(num_turns)
+    return extra_info
+
+
 @register("naive")
 class NaiveRewardLoopManager(RewardLoopManagerBase):
     """The reward manager."""
@@ -42,22 +76,14 @@ class NaiveRewardLoopManager(RewardLoopManagerBase):
 
         data_source = data_item.non_tensor_batch["data_source"]
         ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
-        extra_info = data_item.non_tensor_batch.get("extra_info", {})
-        
-        # Only set in extra_info if needed by reward function, to avoid duplication in non_tensor_batch
-        num_turns_value = data_item.non_tensor_batch.get("__num_turns__", None)
-        if num_turns_value is not None:
-            # Extract scalar from numpy array if needed
-            if isinstance(num_turns_value, np.ndarray):
-                num_turns_value = num_turns_value.item() if num_turns_value.size == 1 else num_turns_value
-            extra_info["num_turns"] = num_turns_value
+        extra_info = build_reward_extra_info(data_item.non_tensor_batch)
         
         # Handle rollout_reward_scores if present
         rollout_reward_scores = data_item.non_tensor_batch.get("reward_scores", {})
         if rollout_reward_scores:
             extra_info["rollout_reward_scores"] = rollout_reward_scores
         
-        pred_mask_value = data_item.non_tensor_batch["pred_mask"]
+        pred_mask_value = extra_info.get("pred_mask", [])
 
         if isinstance(pred_mask_value, np.ndarray) and pred_mask_value.dtype == object:
             if pred_mask_value.ndim == 1:
