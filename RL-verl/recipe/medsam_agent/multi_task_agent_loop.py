@@ -45,6 +45,7 @@ class MultiTaskAgentLoop(ToolAgentLoop):
         self._mask_history = []
         self._detection_results = []
         self._classification_results = []
+        self._tool_trace = []
 
     # ========== 生命周期 ==========
 
@@ -55,6 +56,7 @@ class MultiTaskAgentLoop(ToolAgentLoop):
         self._mask_history = []
         self._detection_results = []
         self._classification_results = []
+        self._tool_trace = []
 
         original_image_data = kwargs.get("multi_modal_data", {}).get("image", None)
         if isinstance(original_image_data, list) and len(original_image_data) > 0:
@@ -81,9 +83,13 @@ class MultiTaskAgentLoop(ToolAgentLoop):
             output.extra_fields["classification_result"] = (
                 self._classification_results[-1] if self._classification_results else {}
             )
-            output.extra_fields["num_turns"] = len({
-                tc.name for tc in getattr(output, "tool_calls", []) or []
-            })
+            output.extra_fields["tool_trace"] = list(self._tool_trace)
+            output.extra_fields["action_count"] = len(self._tool_trace)
+            if isinstance(self._original_image, Image.Image):
+                output.extra_fields["image_size"] = self._original_image.size
+            else:
+                height, width = self._original_image.shape[:2]
+                output.extra_fields["image_size"] = (width, height)
 
             return output
         finally:
@@ -104,6 +110,7 @@ class MultiTaskAgentLoop(ToolAgentLoop):
         self._mask_history = []
         self._detection_results = []
         self._classification_results = []
+        self._tool_trace = []
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
@@ -144,6 +151,20 @@ class MultiTaskAgentLoop(ToolAgentLoop):
         response, reward, res = await tool.execute(instance_id, tool_args)
         return response, reward, res
 
+    @staticmethod
+    def _parse_tool_arguments(tool_call):
+        try:
+            return json.loads(tool_call.arguments)
+        except (TypeError, json.JSONDecodeError):
+            return {}
+
+    @staticmethod
+    def _response_mask(response):
+        if not response.image:
+            return None
+        images = response.image if isinstance(response.image, list) else [response.image]
+        return images[0] if images else None
+
     # ========== 状态处理 ==========
 
     async def _handle_processing_tools_state(self, agent_data) -> Any:
@@ -161,6 +182,18 @@ class MultiTaskAgentLoop(ToolAgentLoop):
         # 检查 stop_action
         is_stop = any(tc.name == "stop_action" for tc in agent_data.tool_calls)
         if is_stop:
+            for tool_call in agent_data.tool_calls:
+                if tool_call.name == "stop_action":
+                    self._tool_trace.append({
+                        "turn": len(self._tool_trace) + 1,
+                        "tool": "stop_action",
+                        "arguments": self._parse_tool_arguments(tool_call),
+                        "success": True,
+                        "result": {"stop": True},
+                        "mask_before": self._latest_mask,
+                        "mask_after": self._latest_mask,
+                        "tool_reward": 0.0,
+                    })
             return AgentState.TERMINATED
 
         # 执行工具
@@ -177,16 +210,30 @@ class MultiTaskAgentLoop(ToolAgentLoop):
         result_data = {}
         tool_name = agent_data.tool_calls[0].name if agent_data.tool_calls else ""
 
-        for resp, reward, res in responses:
+        for tool_call, (resp, reward, res) in zip(
+            agent_data.tool_calls[:self.max_parallel_calls], responses, strict=False
+        ):
             if reward is not None:
                 agent_data.tool_rewards.append(reward)
             response_texts.append(resp.text or "")
-            if resp.image:
-                imgs = resp.image if isinstance(resp.image, list) else [resp.image]
-                if imgs:
-                    new_mask = imgs[0]
+            response_mask = self._response_mask(resp)
+            if response_mask is not None:
+                new_mask = response_mask
             if isinstance(res, dict):
                 result_data.update(res)
+
+            event_result = dict(res) if isinstance(res, dict) else {}
+            event_success = event_result.get("success", not (resp.text or "").startswith("Error:"))
+            self._tool_trace.append({
+                "turn": len(self._tool_trace) + 1,
+                "tool": tool_call.name,
+                "arguments": self._parse_tool_arguments(tool_call),
+                "success": bool(event_success),
+                "result": event_result,
+                "mask_before": self._latest_mask if tool_call.name in ("add_bbox", "add_point") else None,
+                "mask_after": response_mask if tool_call.name in ("add_bbox", "add_point") else None,
+                "tool_reward": float(reward or 0.0),
+            })
 
         response_text = "\n".join(response_texts)
 
@@ -224,7 +271,11 @@ class MultiTaskAgentLoop(ToolAgentLoop):
             }
         elif tool_name == "detect":
             # 检测: 检测框 overlay
-            overlay = self._create_overlay(self._original_image, boxes=result_data.get("boxes"))
+            overlay = self._create_overlay(
+                self._original_image,
+                boxes=result_data.get("boxes"),
+                boxes_normalized=True,
+            )
             user_msg = {
                 "role": "user",
                 "content": [
@@ -274,7 +325,7 @@ class MultiTaskAgentLoop(ToolAgentLoop):
 
     # ========== 辅助 ==========
 
-    def _create_overlay(self, image, mask=None, boxes=None):
+    def _create_overlay(self, image, mask=None, boxes=None, boxes_normalized=False):
         """生成 overlay 图。"""
         if image is None:
             return None
@@ -286,7 +337,7 @@ class MultiTaskAgentLoop(ToolAgentLoop):
 
         if mask is not None:
             if mask.size != image.size:
-                mask = mask.resize(image.size, Image.BILINEAR)
+                mask = mask.resize(image.size, Image.NEAREST)
             m = np.array(mask.convert("L") if mask.mode != "L" else mask)
             bin_mask = (m > 127).astype(np.uint8)
             green = np.array([0, 255, 0], dtype=np.uint8)
@@ -300,8 +351,13 @@ class MultiTaskAgentLoop(ToolAgentLoop):
             for b in boxes:
                 bx = b.get("bbox", b if isinstance(b, list) else [])
                 if len(bx) == 4:
-                    # 如果有 raw_boxes, 用原始像素坐标; 否则映射
-                    x1, y1, x2, y2 = [int(v) for v in bx]
+                    if boxes_normalized:
+                        x1 = int(round(bx[0] * (w - 1) / 999))
+                        y1 = int(round(bx[1] * (h - 1) / 999))
+                        x2 = int(round(bx[2] * (w - 1) / 999))
+                        y2 = int(round(bx[3] * (h - 1) / 999))
+                    else:
+                        x1, y1, x2, y2 = [int(v) for v in bx]
                     cv2.rectangle(arr, (x1, y1), (x2, y2), (255, 0, 0), 2)
 
         return Image.fromarray(arr)
