@@ -275,7 +275,10 @@ class MultiTaskDataset(RLHFDataset):
             "- Classification task: classify then stop\n"
             "- Detection task: detect then stop\n"
             "- Segmentation task: add_bbox, add_point to refine, then stop\n"
-            "- Composite task: detect→add_bbox→add_point→classify→stop\n\n"
+            "- Composite task: first classify the whole image for triage. If suspicious, "
+            "detect the target, initialize and refine segmentation from the detection box, "
+            "then classify the segmented ROI using its bounding region before stopping. "
+            "A confidently normal triage result may stop without localization.\n\n"
             "Choose the right tool based on the user's request."
         )
 
@@ -285,6 +288,9 @@ class MultiTaskDataset(RLHFDataset):
             "classify":  f"Classify this breast ultrasound image: is it benign, malignant, or normal?",
             "detect":    f"Detect all {target}s in this ultrasound image.",
             "segment":   f"Segment the {target} in this ultrasound image.",
-            "composite": f"Analyze this breast ultrasound: find all {target}s, segment them, and classify each one as benign or malignant.",
+            "composite": (
+                f"Analyze this breast ultrasound for {target}. First perform whole-image triage, "
+                "then localize and segment any suspicious lesion, and finally characterize the segmented ROI."
+            ),
         }
         return prompts.get(task_type, f"Analyze this breast ultrasound image.")

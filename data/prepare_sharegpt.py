@@ -389,7 +389,7 @@ Assistant: <tool_call>
 - Coordinates must be in range [0, 999]
 - Always use <tool_call> format, NEVER use ```json format
 - For segmentation: add_bbox first, then add_point to refine, then stop
-- For composite tasks: detect->add_bbox->add_point->classify->stop
+- For composite tasks: first classify the whole image for triage. If suspicious, use classify->detect->add_bbox->add_point->ROI classify->stop
 - Call one tool per turn"""
 
 
@@ -479,7 +479,7 @@ def build_segment(image_path, mask_path, max_clicks=2, label=None):
 
 
 def build_composite(image_path, mask_path, label, bbox=None):
-    """复合轨迹: detect -> add_bbox -> add_point -> classify -> stop
+    """复合轨迹: 全局筛查分类 -> 检测 -> 分割 -> ROI 分类 -> 停止。
     
     注意: 只在第一条 human 消息放 <image> 占位符
     """
@@ -497,23 +497,31 @@ def build_composite(image_path, mask_path, label, bbox=None):
     px, py = int(cx*999/w), int(cy*999/h)
     
     if is_organ(label):
-        prompt = f"<image>Analyze this CT/MR image: detect and segment the {label}."
+        prompt = f"<image>Analyze this CT/MR image: triage, localize, and segment the {label}."
         target = label
-        classify_result = f"The segmented region is {label}."
+        triage_question = f"Does this image contain the target structure {label}?"
+        roi_question = "What is the anatomical structure in the segmented region?"
+        triage_result = f"Triage result: target structure {label} is present (confidence: 0.92)."
+        classify_result = f"ROI classification result: {label} (confidence: 0.92)."
     else:
-        prompt = "<image>Analyze this image: find all targets, segment them, and classify each one."
+        prompt = "<image>Analyze this image: triage for a suspicious lesion, localize it, segment it, and characterize the segmented region."
         target = label.replace("_", " ") if "_" in label else label
-        classify_result = f"Classification result: {label} (confidence: 0.92)"
+        triage_question = "Does this image contain a suspicious lesion?"
+        roi_question = "Classify the lesion in the segmented region."
+        triage_result = f"Triage result: suspicious lesion present (confidence: 0.92)."
+        classify_result = f"ROI classification result: {label} (confidence: 0.92)"
     
     return [
         {"from": "human", "value": prompt},
+        {"from": "gpt", "value": tc("classify", {"question": triage_question})},
+        {"from": "human", "value": triage_result},
         {"from": "gpt", "value": tc("detect", {"target": target})},
         {"from": "human", "value": f"Detected 1 region: bbox={bbox_999}, score=0.95"},
         {"from": "gpt", "value": tc("add_bbox", {"bbox_2d": bbox_999})},
         {"from": "human", "value": "Mask initialized. What is your next action?"},
         {"from": "gpt", "value": tc("add_point", {"point_2d": [px, py], "point_type": "positive"})},
         {"from": "human", "value": "Mask refined. What is your next action?"},
-        {"from": "gpt", "value": tc("classify", {"question": "What is the anatomical structure?" if is_organ(label) else "What is the classification?"})},
+        {"from": "gpt", "value": tc("classify", {"question": roi_question, "region": bbox_999})},
         {"from": "human", "value": classify_result},
         {"from": "gpt", "value": tc("stop_action", {})},
     ]

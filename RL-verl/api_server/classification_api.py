@@ -198,10 +198,12 @@ class BioMedCLIPClassifier:
         }
     
     @torch.no_grad()
-    def classify_region(self, image: Image.Image, bbox: list, text_prompts: list = None) -> dict:
+    def classify_region(
+        self, image: Image.Image, bbox: list, text_prompts: list, labels: list = None
+    ) -> dict:
         """对图像指定区域分类 (裁剪后分类)。"""
         cropped = image.crop(tuple(bbox))
-        return self.classify(cropped, text_prompts)
+        return self.classify(cropped, text_prompts, labels)
 
 
 # ------------------------------------------------------------

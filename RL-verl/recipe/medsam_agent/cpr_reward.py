@@ -327,7 +327,9 @@ def compute_format_reward(tool_calls: list[dict], task_type: str) -> float:
     return 0.0
 
 
-def compute_policy_score(tool_calls: list[dict], task_type: str) -> tuple[float, dict]:
+def compute_policy_score(
+    tool_calls: list[dict], task_type: str, allow_negative_exit: bool = False
+) -> tuple[float, dict]:
     names = [call.get("name", "") for call in tool_calls]
     allowed = {
         "classify": {"classify", "stop_action"},
@@ -343,42 +345,72 @@ def compute_policy_score(tool_calls: list[dict], task_type: str) -> tuple[float,
         missing.append("detect")
     elif task_type == "segment" and not any(name in SEGMENT_TOOLS for name in names):
         missing.append("segment")
-    elif task_type == "composite":
+    elif task_type == "composite" and not allow_negative_exit:
+        if "classify" not in names:
+            missing.append("triage_classify")
         if "detect" not in names:
             missing.append("detect")
         if not any(name in SEGMENT_TOOLS for name in names):
             missing.append("segment")
-        if "classify" not in names:
-            missing.append("classify")
+        last_segment_index = max(
+            (index for index, name in enumerate(names) if name in SEGMENT_TOOLS), default=-1
+        )
+        if not any(name == "classify" and index > last_segment_index for index, name in enumerate(names)):
+            missing.append("roi_classify")
     penalty += 0.35 * len(missing)
 
     order_violations = 0
     if task_type == "composite":
         detect_index = names.index("detect") if "detect" in names else None
         segment_indices = [index for index, name in enumerate(names) if name in SEGMENT_TOOLS]
-        classify_index = names.index("classify") if "classify" in names else None
+        classify_indices = [index for index, name in enumerate(names) if name == "classify"]
+        triage_index = classify_indices[0] if classify_indices else None
+        roi_index = next(
+            (index for index in classify_indices if segment_indices and index > segment_indices[-1]),
+            None,
+        )
+        if triage_index is not None and detect_index is not None and triage_index > detect_index:
+            order_violations += 1
         if detect_index is not None and segment_indices and detect_index > segment_indices[0]:
             order_violations += 1
-        if classify_index is not None and segment_indices and classify_index < segment_indices[-1]:
+        if roi_index is not None and segment_indices and roi_index < segment_indices[-1]:
             order_violations += 1
     if "add_point" in names and "add_bbox" in names and names.index("add_point") < names.index("add_bbox"):
         order_violations += 1
     penalty += 0.2 * order_violations
     score = _clip(1.0 - penalty, -1.0, 1.0)
-    return score, {"missing": missing, "order_violations": order_violations}
+    return score, {
+        "missing": missing,
+        "order_violations": order_violations,
+        "negative_exit": allow_negative_exit,
+    }
 
 
 def compute_synergy_score(
     task_type: str,
     trace: list[dict],
     normalized_detection_boxes: list[list],
+    triage_quality: float,
 ) -> dict:
     if task_type != "composite":
-        return {"det_seg": None, "seg_cls": None, "total": 0.0}
+        return {"triage_det": None, "det_seg": None, "seg_roi": None, "total": 0.0}
     components = []
+    triage_det = None
     det_seg = None
-    seg_cls = None
+    seg_roi = None
     detect_turn = next((event["turn"] for event in trace if event.get("tool") == "detect"), None)
+    triage_event = next(
+        (
+            event
+            for event in trace
+            if event.get("tool") == "classify"
+            and (detect_turn is None or event.get("turn", 0) < detect_turn)
+        ),
+        None,
+    )
+    if triage_event is not None and detect_turn is not None:
+        triage_det = triage_quality
+        components.append(triage_det)
     bbox_event = next(
         (
             event
@@ -393,20 +425,31 @@ def compute_synergy_score(
             det_seg = max(compute_bbox_iou(action_bbox, box) for box in normalized_detection_boxes)
             components.append(det_seg)
 
-    classify_event = next((event for event in trace if event.get("tool") == "classify"), None)
-    final_mask = next(
-        (event.get("mask_after") for event in reversed(trace) if event.get("tool") in SEGMENT_TOOLS),
+    final_segment_event = next(
+        (event for event in reversed(trace) if event.get("tool") in SEGMENT_TOOLS),
         None,
     )
-    if classify_event and final_mask is not None:
-        region = normalize_bbox(classify_event.get("arguments", {}).get("region", []), tool_space=True)
+    final_mask = final_segment_event.get("mask_after") if final_segment_event else None
+    roi_event = next(
+        (
+            event
+            for event in trace
+            if event.get("tool") == "classify"
+            and final_segment_event is not None
+            and event.get("turn", 0) > final_segment_event.get("turn", 0)
+        ),
+        None,
+    )
+    if roi_event and final_mask is not None:
+        region = normalize_bbox(roi_event.get("arguments", {}).get("region", []), tool_space=True)
         if region:
-            seg_cls = bbox_coverage(region, final_mask)
-            components.append(seg_cls)
+            seg_roi = bbox_coverage(region, final_mask)
+            components.append(seg_roi)
     total = float(np.mean(components)) if components else 0.0
     return {
+        "triage_det": None if triage_det is None else round(triage_det, 4),
         "det_seg": None if det_seg is None else round(det_seg, 4),
-        "seg_cls": None if seg_cls is None else round(seg_cls, 4),
+        "seg_roi": None if seg_roi is None else round(seg_roi, 4),
         "total": round(total, 4),
     }
 
@@ -415,7 +458,7 @@ def compute_process_score(
     trace: list[dict],
     gt_mask: Any,
     detection_quality: float,
-    classification_quality: float,
+    gt_label: str,
     terminal_quality: float,
 ) -> tuple[float, list[dict]]:
     details = []
@@ -432,6 +475,9 @@ def compute_process_score(
         elif name == "detect":
             gain = 2 * detection_quality - 1
         elif name == "classify":
+            classification_quality = _classification_quality(
+                _classification_result(event.get("result", {})), gt_label
+            )
             gain = 2 * classification_quality - 1
         elif name == "stop_action":
             gain = 0.5 if terminal_quality >= 0.8 else (-0.5 if terminal_quality < 0.4 else 0.0)
@@ -585,7 +631,28 @@ def compute_score(
     detection_quality, normalized_detection_boxes = _detection_quality(
         detection_boxes, list(gt_bbox), gt_mask, image_size, gt_label
     )
-    classification_quality = _classification_quality(classification_result, gt_label)
+    classification_events = [event for event in trace if event.get("tool") == "classify"]
+    detect_turn = next((event.get("turn", 0) for event in trace if event.get("tool") == "detect"), None)
+    triage_event = next(
+        (event for event in classification_events if detect_turn is not None and event.get("turn", 0) < detect_turn),
+        None,
+    )
+    triage_result = _classification_result(triage_event.get("result", {})) if triage_event else {}
+    triage_quality = _classification_quality(triage_result, gt_label)
+    roi_event = next(
+        (
+            event
+            for event in reversed(classification_events)
+            if any(
+                segment_event.get("tool") in SEGMENT_TOOLS
+                and segment_event.get("turn", 0) < event.get("turn", 0)
+                for segment_event in trace
+            )
+        ),
+        None,
+    )
+    roi_result = _classification_result(roi_event.get("result", {})) if roi_event else {}
+    classification_quality = _classification_quality(roi_result or classification_result, gt_label)
 
     if task_type == "classify":
         terminal_quality = classification_quality
@@ -612,10 +679,11 @@ def compute_score(
         task_components = {}
 
     process_score, event_details = compute_process_score(
-        trace, gt_mask, detection_quality, classification_quality, terminal_quality
+        trace, gt_mask, detection_quality, gt_label, terminal_quality
     )
-    synergy = compute_synergy_score(task_type, trace, normalized_detection_boxes)
-    policy_score, policy_details = compute_policy_score(tool_calls, task_type)
+    synergy = compute_synergy_score(task_type, trace, normalized_detection_boxes, triage_quality)
+    allow_negative_exit = task_type == "composite" and gt_label.lower() == "normal"
+    policy_score, policy_details = compute_policy_score(tool_calls, task_type, allow_negative_exit)
     format_reward = compute_format_reward(tool_calls, task_type)
     action_cost, action_cost_details = compute_action_cost(trace, task_type, gt_mask)
     safety = compute_safety_penalty(
@@ -671,6 +739,8 @@ def compute_score(
         "terminal_quality": float(terminal_quality),
         "result_score": float(terminal_quality),
         "task_components": {key: float(value) for key, value in task_components.items()},
+        "triage_quality": float(triage_quality),
+        "roi_classification_quality": float(classification_quality),
         "process_score": float(process_score),
         "step_score": float(process_score),
         "step_details": event_details,

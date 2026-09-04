@@ -1,6 +1,6 @@
 # VLM 多任务视觉 Agent 实施方案
 
-> 基于 MedSAM-Agent 框架，支持分类、检测、分割三大视觉任务
+> 基于 MedSAM-Agent 框架，以高精度病灶分割为目标，利用筛查分类、检测定位和 ROI 表征形成临床闭环
 > 支持 6 个数据集、4 种模态（超声/X-ray/CT/MR）、5 个解剖部位
 
 ---
@@ -8,7 +8,7 @@
 ## 一、项目目标
 
 ### 核心假设
-> VLM 作为视觉任务智能体，能根据任务自主选择和组合视觉工具（classify / detect / segment），在单任务上接近专用模型，在复合任务上优于独立模型串联。
+> VLM 作为诊断辅助分割智能体，能以全图筛查分类提供语义先验、以检测提供空间先验，并通过交互式分割完成精细病灶量化；在复合病例中学习优于固定工具串联的策略。
 
 ### 设计原则
 - **后端模型零训练**: 检测用 Grounding DINO、分类用 BioMedCLIP、分割用 IMISNet/MedSAM2
@@ -60,13 +60,13 @@ Step 2: RL 数据 (parquet 格式, Verl 要求)
 ```
 Agent (Qwen3-VL-8B)
     │
-    ├── detect    → Grounding DINO API (:8266)   [零样本]
-    ├── classify  → BioMedCLIP API   (:8267)     [零样本]
-    ├── segment   → IMISNet API      (:8265)     [预训练权重]
+    ├── triage classify → BioMedCLIP API (:8267) [全图筛查]
+    ├── detect          → Grounding DINO API (:8266) [候选定位]
+    ├── segment         → IMISNet API (:8265) [边界精描]
     │     ├── add_bbox
     │     ├── add_point
-    │     └── stop_action
-    └── stop_action
+    ├── ROI classify    → BioMedCLIP API (:8267) [病灶表征]
+    └── stop_action     → 正常筛查可提前结束
 ```
 
 ### 3.2 后端模型
@@ -297,10 +297,11 @@ bash RL-verl/recipe/medsam_agent/run_multi_task.sh
 
 | 任务 | 指标 | 说明 |
 |------|------|------|
-| 分类 | Accuracy, F1 | 多类分类 |
-| 检测 | IoU, mAP@0.5 | 检测框精度 |
-| 分割 | Dice, IoU | mask 质量 |
-| 复合 | 端到端 F1 | 检测+分割+分类全对 |
+| 筛查分类 | Sensitivity, Specificity, F1 | 是否提供可靠的病灶存在性/风险先验 |
+| 检测 | IoU, mAP@0.5, Recall | 候选框对分割初始化的空间先验质量 |
+| 分割 | Dice, IoU, HD95 | 核心终点：mask 精度与边界质量 |
+| ROI 表征 | Accuracy, F1 | 基于分割区域的病灶性质判断 |
+| 复合 | 端到端分割增益、漏诊率、平均步数 | 筛查—定位—分割—表征闭环 |
 | 效率 | 平均步数 | 越少越好 |
 
 #### 对比实验
@@ -312,8 +313,8 @@ bash RL-verl/recipe/medsam_agent/run_multi_task.sh
 | C | IMISNet (预训练) | 分割基线 |
 | D | Agent (SFT) | 验证单任务 |
 | E | Agent (SFT+RL) | 验证 RL 提升 |
-| F | 独立模型串联 | 复合任务基线 |
-| G | Agent 复合任务 | 验证组合优势 |
+| F | 固定临床串联（筛查→检测→分割→ROI 表征） | 诊断辅助分割基线 |
+| G | Agent 临床闭环 | 验证动态工具调度与分割增益 |
 
 ---
 

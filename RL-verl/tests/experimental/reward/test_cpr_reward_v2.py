@@ -117,9 +117,10 @@ def test_malignant_to_benign_is_penalized_more_than_benign_to_malignant():
 def test_composite_information_reuse_increases_synergy_reward():
     mask = square_mask()
     solution = (
-        tool_call("detect", {"target": "tumor"})
+        tool_call("classify", {"question": "Is a suspicious lesion present?"})
+        + tool_call("detect", {"target": "tumor"})
         + tool_call("add_bbox", {"bbox_2d": [202, 202, 797, 797]})
-        + tool_call("classify", {"question": "diagnosis"})
+        + tool_call("classify", {"question": "diagnosis", "region": [202, 202, 797, 797]})
         + tool_call("stop_action")
     )
     common = {
@@ -132,23 +133,47 @@ def test_composite_information_reuse_increases_synergy_reward():
         "classification_result": {"label": "malignant", "all_probs": {"malignant": 0.95, "benign": 0.05}},
     }
     aligned_trace = [
-        {"turn": 1, "tool": "detect", "arguments": {"target": "tumor"}, "success": True,
+        {"turn": 1, "tool": "classify", "arguments": {"question": "Is a suspicious lesion present?"},
+         "success": True, "result": {"label": "malignant", "all_probs": {"malignant": 0.9}}, "tool_reward": 0.0},
+        {"turn": 2, "tool": "detect", "arguments": {"target": "tumor"}, "success": True,
          "result": {"boxes": common["detection_boxes"]}, "tool_reward": 0.0},
-        {"turn": 2, "tool": "add_bbox", "arguments": {"bbox_2d": [202, 202, 797, 797]}, "success": True,
+        {"turn": 3, "tool": "add_bbox", "arguments": {"bbox_2d": [202, 202, 797, 797]}, "success": True,
          "mask_before": None, "mask_after": mask, "tool_reward": 0.0},
-        {"turn": 3, "tool": "classify", "arguments": {"question": "diagnosis"}, "success": True,
+        {"turn": 4, "tool": "classify", "arguments": {"question": "diagnosis", "region": [202, 202, 797, 797]}, "success": True,
          "result": common["classification_result"], "tool_reward": 0.0},
-        {"turn": 4, "tool": "stop_action", "arguments": {}, "success": True, "tool_reward": 0.0},
+        {"turn": 5, "tool": "stop_action", "arguments": {}, "success": True, "tool_reward": 0.0},
     ]
     misaligned_trace = [dict(event) for event in aligned_trace]
-    misaligned_trace[1] = dict(misaligned_trace[1])
-    misaligned_trace[1]["arguments"] = {"bbox_2d": [0, 0, 150, 150]}
+    misaligned_trace[2] = dict(misaligned_trace[2])
+    misaligned_trace[2]["arguments"] = {"bbox_2d": [0, 0, 150, 150]}
 
     aligned = compute_score("test", solution, {}, {**common, "tool_trace": aligned_trace})
     misaligned = compute_score("test", solution, {}, {**common, "tool_trace": misaligned_trace})
 
     assert aligned["synergy_score"]["det_seg"] > misaligned["synergy_score"]["det_seg"]
+    assert aligned["synergy_score"]["triage_det"] == 0.9
+    assert aligned["synergy_score"]["seg_roi"] > 0.95
     assert aligned["score"] > misaligned["score"]
+
+
+def test_composite_allows_normal_triage_to_stop_without_localization():
+    solution = tool_call("classify", {"question": "Is a suspicious lesion present?"}) + tool_call("stop_action")
+    extra = {
+        "task_type": "composite",
+        "gt_label": "normal",
+        "classification_result": {"label": "normal", "all_probs": {"normal": 0.95, "malignant": 0.05}},
+        "tool_trace": [
+            {"turn": 1, "tool": "classify", "arguments": {"question": "Is a suspicious lesion present?"},
+             "success": True, "result": {"label": "normal", "all_probs": {"normal": 0.95}}, "tool_reward": 0.0},
+            {"turn": 2, "tool": "stop_action", "arguments": {}, "success": True, "tool_reward": 0.0},
+        ],
+    }
+
+    result = compute_score("test", solution, {}, extra)
+
+    assert result["policy_details"]["negative_exit"] is True
+    assert result["policy_details"]["missing"] == []
+    assert result["safety_penalty"]["total"] == 0.0
 
 
 def test_failed_tool_call_receives_direct_negative_signal():
