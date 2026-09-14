@@ -86,13 +86,11 @@ pip install -r requirements.txt
 ### 2. 生成 SFT 数据
 
 ```bash
+# 当前多病灶实验范围：BUSI、Kvasir-SEG、TN3K。
 python data/prepare_sharegpt.py \
   --source busi data/Dataset_BUSI_with_GT \
   --source kvasir data/kvasir-seg \
-  --source covid data/covid-19 \
   --source tn3k data/tn3k \
-  --source abdct data/datasets/abdct_2d \
-  --source abdmr data/datasets/abdmr_2d \
   --output data/sft_data \
   --llamafactory-dir /mnt/workspace/LlamaFactory
 ```
@@ -104,25 +102,18 @@ SFT 轨迹包括：`classify → stop`、`detect → stop`、`add_bbox → add_p
 先生成四个原生 2D 数据集 parquet，再将 CT/MR 的 3D 数据转换为 2D 切片 parquet：
 
 ```bash
+# 当前多病灶实验范围：BUSI、Kvasir-SEG、TN3K。
+# COVID-19、AbdomenCT、AbdomenMR 暂不纳入本轮 SFT/RL 与评估。
 python data/prepare_all_datasets.py \
   --busi data/Dataset_BUSI_with_GT \
   --kvasir data/kvasir-seg \
-  --covid data/covid-19 \
   --tn3k data/tn3k \
   --output data/datasets
 
-python data/extract_3d_slices.py \
-  --input-dir data/datasets/abdct \
-  --output-dir data/datasets/abdct_2d \
-  --slices-per-volume 3
-
-python data/extract_3d_slices.py \
-  --input-dir data/datasets/abdmr \
-  --output-dir data/datasets/abdmr_2d \
-  --slices-per-volume 3
-
+# 必须使用 --include，避免历史的 X-ray、CT、MR parquet 被自动合入。
 python data/combine_parquet.py \
   --datasets-dir data/datasets \
+  --include busi kvasir tn3k \
   --output data/datasets/combined
 ```
 

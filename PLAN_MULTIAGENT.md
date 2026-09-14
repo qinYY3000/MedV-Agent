@@ -115,15 +115,13 @@ pip install nibabel
 python data/extract_3d_slices.py --input-dir data/datasets/abdct --output-dir data/datasets/abdct_2d --slices-per-volume 5
 python data/extract_3d_slices.py --input-dir data/datasets/abdmr --output-dir data/datasets/abdmr_2d --slices-per-volume 5
 
-# 生成 sharegpt SFT 数据
+# 当前多病灶实验范围：BUSI、Kvasir-SEG、TN3K。
+# COVID-19、AbdomenCT、AbdomenMR 暂不纳入本轮 SFT/RL 与评估。
 cd /mnt/workspace/MedSAM-Agent
 python data/prepare_sharegpt.py \
     --source busi data/Dataset_BUSI_with_GT \
     --source kvasir data/kvasir-seg \
-    --source covid data/covid-19 \
     --source tn3k data/tn3k \
-    --source abdct data/datasets/abdct_2d \
-    --source abdmr data/datasets/abdmr_2d \
     --output data/sft_data \
     --llamafactory-dir /mnt/workspace/LlamaFactory
 ```
@@ -131,30 +129,20 @@ python data/prepare_sharegpt.py \
 #### Step 1.2: RL 数据生成 (parquet)
 
 ```bash
-# 1. 扫描 4 个 2D 数据集 → parquet
+# 当前多病灶实验范围：BUSI、Kvasir-SEG、TN3K。
+# COVID-19、AbdomenCT、AbdomenMR 暂不纳入本轮 SFT/RL 与评估。
+# 1. 扫描 3 个 2D 数据集 → parquet
 python data/prepare_all_datasets.py \
-    --busi  data/Dataset_BUSI_with_GT \
+    --busi data/Dataset_BUSI_with_GT \
     --kvasir data/kvasir-seg \
-    --covid data/covid-19 \
-    --tn3k  data/tn3k \
+    --tn3k data/tn3k \
     --output data/datasets
 
-python data/prepare_all_datasets.py \
-    --abdct  data/Dataset701_AbdomenCT \
-    # --abdmr data/Dataset701_AbdomenMR \
-    --output data/datasets
-
-# 2. CT/MR 3D→2D 切片（直接输出 2D parquet）
-#    本地切片后上传 PNG 到服务器，服务器上用 --parquet-only 重建 parquet（秒级）
-python data/extract_3d_slices.py --input-dir data/datasets/abdct --output-dir data/datasets/abdct_2d --slices-per-volume 3
-python data/extract_3d_slices.py --input-dir data/datasets/abdmr --output-dir data/datasets/abdmr_2d --slices-per-volume 3
-
-#    服务器上重建 parquet（不重新切片，只修正路径，不需要 3D NIfTI）
-# python data/extract_3d_slices.py --output-dir data/datasets/abdct_2d --parquet-only
-# python data/extract_3d_slices.py --output-dir data/datasets/abdmr_2d --parquet-only
-
-# 3. 合并所有数据集 → combined/ 目录
-python data/combine_parquet.py --datasets-dir data/datasets --output data/datasets/combined
+# 2. 仅合并本轮选定数据集；不要自动混入历史 X-ray、CT、MR parquet。
+python data/combine_parquet.py \
+    --datasets-dir data/datasets \
+    --include busi kvasir tn3k \
+    --output data/datasets/combined
 ```
 
 #### Step 1.3: 启动三个 API

@@ -128,6 +128,7 @@ def match_instance_masks(
         matched_ground_truth.add(gt_index)
         matches.append({"pred_index": pred_index, "gt_index": gt_index, "iou": float(iou)})
 
+    matches.sort(key=lambda item: item["pred_index"])
     unmatched_predictions = [index for index in range(len(predicted_masks)) if index not in matched_predictions]
     unmatched_ground_truth = [index for index in range(len(ground_truth_masks)) if index not in matched_ground_truth]
     return matches, unmatched_predictions, unmatched_ground_truth

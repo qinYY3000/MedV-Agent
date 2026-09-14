@@ -87,6 +87,17 @@ def build_bbox_instances(bboxes: List[dict], label: str, sample_id: str, mask_pa
     return instances
 
 
+def build_single_instance(mask_path: Optional[str], bbox: Optional[List[int]], label: str, sample_id: str) -> dict:
+    """将单目标样本转换为与多实例样本一致的 schema。"""
+    return {
+        "instance_id": f"{sample_id}::0",
+        "label": label,
+        "mask_path": str(Path(mask_path).resolve()) if mask_path else None,
+        "bbox": bbox,
+        "mask_scope": "instance",
+    }
+
+
 def split_samples(samples: list, train_ratio=0.7, val_ratio=0.15, seed=42):
     """统一切分: train 70%, val 15%, test 15%。"""
     rng = np.random.RandomState(seed)
@@ -263,14 +274,16 @@ def scan_tn3k(tn3k_root: str) -> Dict[str, list]:
             if not mask_path.exists():
                 continue
             bbox = bbox_from_mask(str(mask_path))
+            sample_id = f"tn3k::{sid}"
             samples.append({
                 "image_path": str(img_file.resolve()),
                 "mask_path": str(mask_path.resolve()),
                 "bbox": bbox,
+                "instances": [build_single_instance(str(mask_path), bbox, "thyroid_nodule", sample_id)],
                 "label": "thyroid_nodule",
                 "modality": "ultrasound",
                 "anatomy": "thyroid",
-                "sample_id": f"tn3k::{sid}",
+                "sample_id": sample_id,
             })
     print(f"TN3K: {len(samples)} samples")
     return split_samples(samples)

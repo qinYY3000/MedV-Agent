@@ -11,23 +11,40 @@ import pandas as pd
 from pathlib import Path
 
 
+def select_dataset_dirs(base: Path, include: list[str] | None = None) -> list[Path]:
+    """选择参与合并的数据集目录，include 指定时严格按白名单处理。"""
+    if include:
+        directories = []
+        for dataset_name in include:
+            directory = base / dataset_name
+            if not directory.is_dir():
+                raise ValueError(f"Requested dataset directory not found: {dataset_name}")
+            directories.append(directory)
+        return directories
+
+    excluded = {"combined", "abdct", "abdmr"}
+    return sorted(
+        (directory for directory in base.iterdir() if directory.is_dir() and directory.name not in excluded),
+        key=lambda directory: directory.name,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Combine all dataset parquets")
     parser.add_argument("--datasets-dir", type=str, default="data/datasets",
                         help="Directory containing per-dataset parquet subdirs")
     parser.add_argument("--output", type=str, default="data/datasets/combined",
                         help="Output directory for combined parquets")
+    parser.add_argument("--include", nargs="+", default=None,
+                        help="Only combine the specified dataset subdirectories, e.g. --include busi kvasir tn3k")
     args = parser.parse_args()
 
     base = Path(args.datasets_dir)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
 
-    # 自动发现所有数据集子目录（排除 combined 本身）
-    ds_dirs = [d for d in base.iterdir()
-               if d.is_dir() and d.name != "combined" and d.name != "abdct" and d.name != "abdmr"]
-
-    print(f"Found datasets: {[d.name for d in ds_dirs]}")
+    ds_dirs = select_dataset_dirs(base, include=args.include)
+    print(f"Selected datasets: {[directory.name for directory in ds_dirs]}")
 
     for split in ["train", "val", "test"]:
         all_dfs = []
