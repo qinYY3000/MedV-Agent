@@ -103,6 +103,59 @@ def compute_dice(pred: Any, gt: Any) -> float:
     return float(2 * intersection / denominator) if denominator else 1.0
 
 
+def match_instance_masks(
+    predicted_masks: list[Any], ground_truth_masks: list[Any], min_iou: float = 0.5
+) -> tuple[list[dict], list[int], list[int]]:
+    """按 IoU 将预测和 GT 实例做一对一贪心匹配。
+
+    返回匹配对、未匹配预测索引和未匹配 GT 索引。未匹配 GT 是实例级漏检，
+    未匹配预测是实例级假阳性，可被多实例 CPR 用于安全与终局质量计算。
+    """
+    candidates = []
+    for pred_index, predicted_mask in enumerate(predicted_masks):
+        for gt_index, ground_truth_mask in enumerate(ground_truth_masks):
+            iou = compute_iou(predicted_mask, ground_truth_mask)
+            if iou >= min_iou:
+                candidates.append((iou, pred_index, gt_index))
+
+    matched_predictions = set()
+    matched_ground_truth = set()
+    matches = []
+    for iou, pred_index, gt_index in sorted(candidates, reverse=True):
+        if pred_index in matched_predictions or gt_index in matched_ground_truth:
+            continue
+        matched_predictions.add(pred_index)
+        matched_ground_truth.add(gt_index)
+        matches.append({"pred_index": pred_index, "gt_index": gt_index, "iou": float(iou)})
+
+    unmatched_predictions = [index for index in range(len(predicted_masks)) if index not in matched_predictions]
+    unmatched_ground_truth = [index for index in range(len(ground_truth_masks)) if index not in matched_ground_truth]
+    return matches, unmatched_predictions, unmatched_ground_truth
+
+
+def summarize_instance_segmentation(
+    predicted_masks: list[Any], ground_truth_masks: list[Any], min_iou: float = 0.5
+) -> dict:
+    """计算实例级分割质量、召回率、漏检和假阳性统计。"""
+    matches, unmatched_predictions, unmatched_ground_truth = match_instance_masks(
+        predicted_masks, ground_truth_masks, min_iou=min_iou
+    )
+    matched_dice = [compute_dice(predicted_masks[item["pred_index"]], ground_truth_masks[item["gt_index"]]) for item in matches]
+    recall = len(matches) / len(ground_truth_masks) if ground_truth_masks else 1.0
+    precision = len(matches) / len(predicted_masks) if predicted_masks else (1.0 if not ground_truth_masks else 0.0)
+    mean_dice = float(np.mean(matched_dice)) if matched_dice else 0.0
+    return {
+        "matches": matches,
+        "instance_recall": float(recall),
+        "instance_precision": float(precision),
+        "mean_dice": mean_dice,
+        "missed_instance_count": len(unmatched_ground_truth),
+        "false_positive_instance_count": len(unmatched_predictions),
+        "unmatched_prediction_indices": unmatched_predictions,
+        "unmatched_ground_truth_indices": unmatched_ground_truth,
+    }
+
+
 def compute_bbox_iou(box_a: list, box_b: list) -> float:
     if len(box_a) != 4 or len(box_b) != 4:
         return 0.0

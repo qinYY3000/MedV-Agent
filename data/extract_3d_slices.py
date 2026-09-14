@@ -44,6 +44,54 @@ def _bbox_from_mask(mask_path: str):
         return None
 
 
+def attach_image_instances(samples: List[dict]) -> List[dict]:
+    """为同一 2D 切片的每条兼容样本附加完整实例列表。
+
+    现有训练链路仍可通过顶层 mask_path/bbox 使用单目标记录；instances
+    则保留该切片内全部器官/病灶，为后续逐实例 Agent 与奖励提供图像级 GT。
+    """
+    grouped = {}
+    for sample in samples:
+        grouped.setdefault(sample["image_path"], []).append(sample)
+
+    for image_samples in grouped.values():
+        instances = [
+            {
+                "instance_id": sample["sample_id"],
+                "label": sample["label"],
+                "mask_path": sample["mask_path"],
+                "bbox": sample["bbox"],
+                "mask_scope": "instance",
+            }
+            for sample in image_samples
+        ]
+        for sample in image_samples:
+            sample["instances"] = instances
+    return samples
+
+
+def split_by_image(samples: List[dict], train_ratio: float = 0.7, val_ratio: float = 0.15, seed: int = 42) -> dict[str, List[dict]]:
+    """按图像而非实例切分，防止同图器官/病灶泄漏到不同数据划分。"""
+    grouped = {}
+    for sample in samples:
+        grouped.setdefault(sample["image_path"], []).append(sample)
+
+    image_paths = list(grouped)
+    rng = np.random.RandomState(seed)
+    rng.shuffle(image_paths)
+    train_end = int(len(image_paths) * train_ratio)
+    val_end = train_end + int(len(image_paths) * val_ratio)
+    split_paths = {
+        "train": image_paths[:train_end],
+        "val": image_paths[train_end:val_end],
+        "test": image_paths[val_end:],
+    }
+    return {
+        split_name: [sample for image_path in paths for sample in grouped[image_path]]
+        for split_name, paths in split_paths.items()
+    }
+
+
 def load_nifti(path: str):
     """加载 NIfTI 文件，返回 numpy array。"""
     try:
@@ -287,19 +335,11 @@ def main():
                     "is_3d": False,
                 })
 
-        # 按样本 ID 重新切分 train/val/test
-        rng = np.random.RandomState(42)
-        indices = list(range(len(all_samples)))
-        rng.shuffle(indices)
-        n = len(indices)
-        n_train = int(n * 0.7)
-        n_val = int(n * 0.15)
+        # 在图像级切分前保留同一切片的全部器官实例。
+        all_samples = attach_image_instances(all_samples)
 
-        splits = {
-            "train": [all_samples[i] for i in indices[:n_train]],
-            "val":   [all_samples[i] for i in indices[n_train:n_train + n_val]],
-            "test":  [all_samples[i] for i in indices[n_train + n_val:]],
-        }
+        # 按图像 ID 重新切分 train/val/test，确保同图多器官不会跨集合泄漏。
+        splits = split_by_image(all_samples, seed=42)
 
         for split_name, split_samples in splits.items():
             if split_samples:

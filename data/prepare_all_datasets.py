@@ -11,7 +11,8 @@
 
 输出:
   - 统一 parquet 格式 (train/val/test split)
-  - 每条记录: {image_path, mask_path, bbox, label, modality, anatomy, sample_id}
+  - 每条记录: {image_path, mask_path, bbox, instances, label, modality, anatomy, sample_id}
+  - `mask_path` / `bbox` 保留首个实例以兼容单目标训练；`instances` 保留同图全部实例
   - 按统一 7:1.5:1.5 切分 (seed=42)
 
 用法:
@@ -50,6 +51,40 @@ def bbox_from_mask(mask_path: str) -> Optional[List[int]]:
         return [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
     except Exception:
         return None
+
+
+def build_mask_instances(mask_paths: List[str], label: str, sample_id: str) -> List[dict]:
+    """将同图的多个实例 mask 转换为可序列化的实例列表。"""
+    instances = []
+    for index, mask_path in enumerate(sorted(mask_paths)):
+        resolved_path = str(Path(mask_path).resolve())
+        instances.append({
+            "instance_id": f"{sample_id}::{index}",
+            "label": label,
+            "mask_path": resolved_path,
+            "bbox": bbox_from_mask(resolved_path),
+            "mask_scope": "instance",
+        })
+    return instances
+
+
+def build_bbox_instances(bboxes: List[dict], label: str, sample_id: str, mask_path: str) -> List[dict]:
+    """将检测标注框转换为实例列表。
+
+    Kvasir 当前提供图级语义 mask；每个实例保留独立 bbox，mask_scope
+    显式标为 semantic_union，避免将图级 mask 误当成实例级分割真值。
+    """
+    resolved_mask_path = str(Path(mask_path).resolve())
+    instances = []
+    for index, box in enumerate(bboxes):
+        instances.append({
+            "instance_id": f"{sample_id}::{index}",
+            "label": label,
+            "mask_path": resolved_mask_path,
+            "bbox": [int(box["xmin"]), int(box["ymin"]), int(box["xmax"]), int(box["ymax"])],
+            "mask_scope": "semantic_union",
+        })
+    return instances
 
 
 def split_samples(samples: list, train_ratio=0.7, val_ratio=0.15, seed=42):
@@ -99,16 +134,19 @@ def scan_busi(busi_root: str) -> Dict[str, list]:
         for sid, data in sample_dict.items():
             if data["image"] is None:
                 continue
-            mask_path = data["masks"][0] if data["masks"] else None
-            bbox = bbox_from_mask(mask_path) if mask_path else None
+            sample_id = f"busi::{sid}"
+            instances = build_mask_instances(data["masks"], class_name, sample_id)
+            primary_instance = instances[0] if instances else None
             samples.append({
                 "image_path": str(Path(data["image"]).resolve()),
-                "mask_path": str(Path(mask_path).resolve()) if mask_path else None,
-                "bbox": bbox,
+                # 保留第一实例字段，兼容当前单目标训练与奖励链路。
+                "mask_path": primary_instance["mask_path"] if primary_instance else None,
+                "bbox": primary_instance["bbox"] if primary_instance else None,
+                "instances": instances,
                 "label": class_name,
                 "modality": "ultrasound",
                 "anatomy": "breast",
-                "sample_id": f"busi::{sid}",
+                "sample_id": sample_id,
             })
     print(f"BUSI: {len(samples)} samples")
     for cls in ["benign", "malignant", "normal"]:
@@ -135,16 +173,19 @@ def scan_kvasir(kvasir_root: str) -> Dict[str, list]:
             continue
         bi = bbox_data.get(sid, {})
         bboxes = bi.get("bbox", [])
-        bbox = [int(bboxes[0]["xmin"]), int(bboxes[0]["ymin"]),
-                int(bboxes[0]["xmax"]), int(bboxes[0]["ymax"])] if bboxes else None
+        sample_id = f"kvasir::{sid}"
+        instances = build_bbox_instances(bboxes, "polyp", sample_id, str(mask_path))
+        primary_instance = instances[0] if instances else None
         samples.append({
             "image_path": str(img_file.resolve()),
+            # 图级 mask 仍用于当前兼容路径；多实例训练应使用 instances 中的 bbox。
             "mask_path": str(mask_path.resolve()),
-            "bbox": bbox,
+            "bbox": primary_instance["bbox"] if primary_instance else None,
+            "instances": instances,
             "label": "polyp",
             "modality": "endoscopy",
             "anatomy": "colon",
-            "sample_id": f"kvasir::{sid}",
+            "sample_id": sample_id,
         })
     print(f"Kvasir-SEG: {len(samples)} samples")
     return split_samples(samples)

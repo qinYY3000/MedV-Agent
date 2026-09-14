@@ -12,6 +12,8 @@ parquet 列:
 import io
 import json
 import logging
+from pathlib import Path
+
 import numpy as np
 from PIL import Image
 import torch
@@ -29,6 +31,34 @@ class MultiTaskDataset(RLHFDataset):
         super().__init__(*args, **kwargs)
         self.qwen_image_size = qwen_image_size
 
+    @staticmethod
+    def _load_instance_ground_truth(raw_instances) -> list[dict]:
+        """加载图像级实例列表，供后续多实例奖励和 Agent 编排使用。
+
+        保留单目标字段以兼容既有训练样本；无法访问的实例 mask 会被跳过，
+        而不是回退为空白图或将图级 mask 错当成实例级标注。
+        """
+        if isinstance(raw_instances, np.ndarray):
+            raw_instances = raw_instances.tolist()
+        if not isinstance(raw_instances, list):
+            return []
+
+        instances = []
+        for raw_instance in raw_instances:
+            if not isinstance(raw_instance, dict):
+                continue
+            instance = dict(raw_instance)
+            mask_path = instance.get("mask_path")
+            mask_scope = instance.get("mask_scope", "instance")
+            if mask_scope != "instance" or not mask_path or not Path(mask_path).is_file():
+                continue
+            try:
+                instance["ground_truth_mask"] = Image.open(mask_path).convert("L")
+            except OSError:
+                continue
+            instances.append(instance)
+        return instances
+
     def __getitem__(self, item):
         row_dict: dict = self.dataframe[item]
         image_key = "images"
@@ -38,6 +68,7 @@ class MultiTaskDataset(RLHFDataset):
         task_type = extra.get("task_type", "segment")
         target = extra.get("target_description", "breast tumor")
         label = extra.get("label", "unknown")
+        instance_ground_truth = self._load_instance_ground_truth(row_dict.get("instances", []))
 
         # 加载图像
         images = []
@@ -111,6 +142,7 @@ class MultiTaskDataset(RLHFDataset):
             "gt_label": gt_label,
             "label": label,
             "reward_model": reward_data,
+            "ground_truth_instances": instance_ground_truth,
         })
         row_dict["extra_info"] = out_extra
 

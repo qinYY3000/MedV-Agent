@@ -1,136 +1,206 @@
+# MedV-Agent 多任务医学视觉 Agent 扩展
 
-# MedSAM-Agent: Empowering Interactive Medical Image Segmentation with Multi-turn Agentic Reinforcement Learning
-[🤖 **Model**](https://huggingface.co/Saint-lsy/MedSAM-Agent-Qwen3-VL-8B-MedSAM2) | [**🤗 Dataset**](#) | [**📖 Paper**](https://arxiv.org/abs/2602.03320)
-<p align="center">
-  <img src="./assets/logo.png" alt="" width="120" height="140">
-</p>
+![MedV-Agent](./assets/logo.png)
 
-Shengyuan Liu<sup>1</sup> &emsp; Liuxin Bao<sup>1</sup> &emsp;
-Qi Yang<sup>2,3</sup> &emsp; Wanting Geng<sup>2,4</sup> &emsp;
-Boyun Zheng<sup>1</sup> &emsp; Chenxin Li<sup>1</sup> &emsp; 
-Wenting Chen<sup>5</sup> Houwen Peng<sup>2✉</sup> 
-Yixuan Yuan<sup>1✉</sup>
+## 项目定位
 
-<sup>1</sup>Chinese University of Hong Kong &emsp; <sup>2</sup>Hunyuan Group, Tencent&emsp; <sup>3</sup>Institute of Automation, the Chinese Academy of Sciences &emsp;<sup>4</sup>Dalian University of Technology &emsp; <sup>5</sup>Stanford University&emsp;
+本项目基于上游 `MedSAM-Agent` 的交互式分割能力，扩展为面向多工具医学视觉分析的任务条件化 Agent：
 
-<sup>✉</sup> Corresponding Author. 
+```text
+全图筛查分类 → 候选病灶检测 → 交互式精细分割 → ROI 区域级表征 → 自主停止
+```
 
-## 🚀Overview
-In this work, we propose MedSAM-Agent, a framework that reformulates interactive segmentation as a multi-step autonomous decision-making process. First, we introduce a hybrid prompting strategy for expert-curated trajectory generation, enabling the model to internalize human-like decision heuristics and adaptive refinement strategies. Furthermore, we develop a two-stage training pipeline that integrates multi-turn, end-to-end outcome verification with a clinical-fidelity process reward design to promote interaction parsimony and decision efficiency. 
-![Main](assets/main.gif)
+- VLM 根据用户任务、当前视觉状态与工具反馈，动态选择 `classify`、`detect`、`add_bbox`、`add_point` 或 `stop_action`；
+- 对明确正常的筛查样本，允许安全提前结束，避免无意义的定位和分割；
+- 分类、检测与分割后端均以独立服务封装，可替换、可独立部署；
+- 使用规则驱动的 **CPR v2（Clinical Process Reward v2）** 为 GRPO 提供任务质量、过程增益、工具协同、交互成本与安全风险的联合奖励。
 
-### ✨ Todo List
-- [ ] Release the SFT and RL dataset for MedSAM-Agent.
-- [ ] Release the code of trajectory generation.
-- [x] Release the paper, model and the base code for MedSAM-Agent.
+本项目的推荐研究主题为：
 
-## Environment Setup
-* We use python 3.11/CUDA 12.9/torch 2.8.0 for implementation.
-* We train our models on 8 NVIDIA H20 GPUs with 96G memory.
+> **面向多工具医学视觉智能体的任务条件化临床过程奖励方法**  
+> **Task-Conditioned Clinical Process Reward for Multi-Tool Medical Vision Agents**
+
+## 核心方法
+
+### 多工具 Agent
+
+| 工具 | 后端 | 作用 |
+| --- | --- | --- |
+| `classify` | BioMedCLIP | 全图筛查或 ROI 区域级分类 |
+| `detect` | Grounding DINO | 文本驱动的候选目标定位 |
+| `add_bbox` / `add_point` | IMISNet / MedSAM2 | 交互式分割初始化与迭代细化 |
+| `stop_action` | Agent 策略 | 根据当前任务质量自主停止 |
+
+复合任务并非固定流水线。Agent 可以根据任务类型及中间反馈决定是否继续调用工具、是否复用检测框或分割区域，以及何时停止。
+
+### CPR v2：任务条件化临床过程奖励
+
+CPR v2 不只比较最终预测与真值，还将 Agent 轨迹表示为工具事件序列，联合评估：
+
+- **终局质量**：分类、检测、分割的最终任务质量；
+- **事件级状态增益**：每次工具调用是否确实改善当前状态，例如分割前后 IoU/Dice 的变化；
+- **跨工具信息流协同**：筛查分类→检测、检测框→分割提示、分割 mask→ROI 分类是否被有效复用；
+- **任务条件化策略与格式**：不同任务只评价其应执行的有效动作，并检查工具调用格式；
+- **交互成本与停止质量**：惩罚重复、无关、失败和无效细化调用，鼓励在质量足够时及时停止；
+- **规则式临床安全约束**：对恶性/异常→正常、目标漏检、低质量分割及正常样本假阳性施加非对称惩罚。
+
+当前实现为低开销的规则版 CPR v2，奖励裁剪到 `[-1, 1]`。学习式 Clinical Judge、推理置信度评分与医生一致性评价属于后续工作，尚未作为当前结果声明。详细设计见 [`docs/PROJECT_INNOVATIONS.md`](docs/PROJECT_INNOVATIONS.md)。
+
+## 数据与训练链路
+
+项目覆盖六个数据集、五种模态：
+
+| 数据集 | 模态 | 核心任务 |
+| --- | --- | --- |
+| BUSI | 超声 | 分类、检测、分割 |
+| Kvasir-SEG | 内镜 | 分类、检测、分割 |
+| COVID-19 | X-ray | 分类、分割 |
+| TN3K | 超声 | 分类、检测、分割 |
+| AbdomenCT | CT | 多器官分类、检测、分割 |
+| AbdomenMR | MR | 多器官分类、检测、分割 |
+
+```text
+SFT：原图目录 → ShareGPT 多轮工具轨迹 → LlamaFactory LoRA SFT
+RL ：统一样本字段 → parquet → CT/MR 3D NIfTI 转 2D 切片 → combined parquet → verl GRPO
+```
+
+CT/MR 数据会将每个 3D NIfTI 体数据转换为代表性 2D 切片，并为同一切片内的每个器官生成独立的 mask、bbox 与训练样本。数据处理的详细步骤见 [`PLAN_MULTIAGENT.md`](PLAN_MULTIAGENT.md)。
+
+## 快速开始
+
+### 1. 准备依赖与模型
+
+本项目包含 NVIDIA CUDA 与 AMD ROCm 的训练/服务适配脚本；请根据实际硬件安装匹配的 PyTorch、vLLM/SGLang 与后端模型依赖。至少准备：
+
+- Grounding DINO 权重及 `bert-base-uncased` tokenizer；
+- BioMedCLIP 权重及其文本编码器缓存；
+- IMISNet 或 MedSAM2 权重；
+- 用于 SFT/RL 的 Qwen-VL 系列模型及 LlamaFactory、verl 环境。
 
 ```bash
-# create environment
-conda create -n msagent python=3.11 
-conda activate msagent
-
-# Step 1: install PyTorch first (flash-attn depends on it)
-pip install torch==2.8.0
-
-# Step 2: install remaining dependencies
 pip install -r requirements.txt
 ```
 
-## 📦Evaluation
-### Model Download
-We support three segmentation backbones: MedSAM2, SAM, and IMISNet. Please download the checkpoints from:
-- MedSAM2: [link](https://medsam2.github.io/)
-- SAM2.1: [link](https://huggingface.co/facebook/sam2.1-hiera-base-plus)
-- IMISNet: [link](https://github.com/uni-medical/IMIS-Bench)
+> 具体版本组合与离线模型准备请以 [`PLAN_MULTIAGENT.md`](PLAN_MULTIAGENT.md) 和对应启动脚本为准。ROCm 环境需使用匹配 ROCm 版本的 PyTorch wheel，并建议使用 SDPA，避免将 CUDA 版 `flash-attn` 安装到 ROCm 环境。
 
-For SAM2.1 and IMISNet, please also download the dependency repositories and install them:
-```bash
-cd third_party/
-git clone https://github.com/facebookresearch/sam2.git
-cd sam2
-pip install -e .
-```
-### Dataset Preparation
-In this repo, our dataset is based on [BioMedParse](https://huggingface.co/datasets/microsoft/BiomedParseData) and [UniBioMed](https://huggingface.co/datasets/Luffy503/UniBiomed). We evaluate our model on 6 modalities and 21 datasets. Details of dataset split can be found in our paper.
-
-We will release the SFT trajectory dataset and RL training dataset soon.
-### Inference
-- **Single sample (one image):**
-Run the script in [infer/run_single_inference.py](infer/run_single_inference.py) with your paths:
+### 2. 生成 SFT 数据
 
 ```bash
-cd infer
-python run_single_inference.py \
-  --img-path infer/demo/BTCV-0-106_CT_abdomen.png \
-  --target-description "right kidney in abdomen CT" \
-  --model-path /path/to/mllm_model \
-  --seg-checkpoint /path/to/MedSAM2_latest.pt \
-  --seg-model medsam
+python data/prepare_sharegpt.py \
+  --source busi data/Dataset_BUSI_with_GT \
+  --source kvasir data/kvasir-seg \
+  --source covid data/covid-19 \
+  --source tn3k data/tn3k \
+  --source abdct data/datasets/abdct_2d \
+  --source abdmr data/datasets/abdmr_2d \
+  --output data/sft_data \
+  --llamafactory-dir /mnt/workspace/LlamaFactory
 ```
 
-- **Whole-dataset / multi-GPU:** Edit the variables at the top of [infer/run_batch_inference.sh](infer/run_batch_inference.sh): `MODEL_PATH` (local Qwen checkpoint or `gpt`), `SEG_MODEL` (`medsam`, `sam`, `imisnet`), segmentation checkpoints/configs, `DATA_ROOT`, `DATASETS`, `SPLIT`, GPU topology (`N_GPUS`, `PROCESSES_PER_GPU`).
+SFT 轨迹包括：`classify → stop`、`detect → stop`、`add_bbox → add_point → stop`，以及筛查/检测/分割/ROI 分类组成的复合轨迹。对 CT/MR 器官任务，目标名称会显式写入 prompt，例如 “Segment the liver in this CT/MR image.”。
+
+### 3. 生成并合并 RL parquet
+
+先生成四个原生 2D 数据集 parquet，再将 CT/MR 的 3D 数据转换为 2D 切片 parquet：
 
 ```bash
-bash run_batch_inference.sh
+python data/prepare_all_datasets.py \
+  --busi data/Dataset_BUSI_with_GT \
+  --kvasir data/kvasir-seg \
+  --covid data/covid-19 \
+  --tn3k data/tn3k \
+  --output data/datasets
+
+python data/extract_3d_slices.py \
+  --input-dir data/datasets/abdct \
+  --output-dir data/datasets/abdct_2d \
+  --slices-per-volume 3
+
+python data/extract_3d_slices.py \
+  --input-dir data/datasets/abdmr \
+  --output-dir data/datasets/abdmr_2d \
+  --slices-per-volume 3
+
+python data/combine_parquet.py \
+  --datasets-dir data/datasets \
+  --output data/datasets/combined
 ```
 
-## RL Training
+`combined/train.parquet`、`combined/val.parquet` 与 `combined/test.parquet` 是多数据集 RL 采样入口。当前 parquet 预处理链路保存图像与 mask 路径；对应原始图像/切片和 mask 文件必须在训练节点按记录路径可访问，除非另行完成图片 bytes 内嵌转换。
 
-### Environment Setup
-Please follow the instructions in [RL-verl/README.md](RL-verl/README.md) to set up the Verl environment.
+### 4. 启动三个工具服务
 
-Notice: the version of Sglang==0.5.4
-
-We support two segmentation backbones for RL training: MedSAM2 and IMISNet. 
-
-### API Server (segmentation)
-First, start the API server for segmentation model inference. You can choose either MedSAM2 or IMISNet by modifying the variables in [RL-verl/api_server/run_api.sh](RL-verl/api_server/run_api.sh):
+分别在独立终端启动：
 
 ```bash
-bash RL-verl/api_server/run_api.sh
+bash RL-verl/api_server/run_api.sh                 # segmentation :8265
+bash RL-verl/api_server/run_detection_api.sh       # detection    :8266
+bash RL-verl/api_server/run_classification_api.sh  # classification:8267
 ```
 
-### RL Training with Verl
-- Script: [RL-verl/recipe/medsam_agent/run.sh](RL-verl/recipe/medsam_agent/run.sh)
-
-- You can modify the following variables in `run.sh`:
-  - `MODEL`: segmentation backbone, options: `medsam2` or `imisnet`
-  - `SAVE_CHECKPOINT_DIR`: root directory to save Verl training outputs
-  - `DATASET_TRAIN`: path to training dataset parquet file
-  - `DATASET_VAL`: path to validation dataset parquet file
-  - `REF_MODEL_PATH`: path to the base MLLM model (local checkpoint or `Qwen/Qwen3-VL-8B-Instruct`)
+健康检查：
 
 ```bash
-bash RL-verl/recipe/medsam_agent/run.sh
+curl http://localhost:8265/health
+curl http://localhost:8266/health
+curl http://localhost:8267/health
 ```
 
+### 5. SFT 与 GRPO
 
-## 🎈Acknowledgements
-Greatly appreciate the tremendous effort for the following projects!
-- [Verl](https://github.com/verl-project/verl)
-- [Llama-Factory](https://github.com/hiyouga/LlamaFactory)
-- [SAM2](https://github.com/facebookresearch/sam2)
+SFT 使用 LlamaFactory 对 ShareGPT 工具轨迹进行 LoRA 微调；合并 LoRA 权重后，使用 verl 进行多轮 GRPO：
+
+```bash
+# 192GB ROCm 配置示例
+bash RL-verl/recipe/medsam_agent/run_multi_task.sh
+
+# 单卡 24GB NVIDIA 配置示例（4B 模型）
+bash RL-verl/recipe/medsam_agent/run_nvidia_24g.sh
+```
+
+核心训练配置包括：
+
+- `algorithm.adv_estimator=grpo`；
+- `actor_rollout_ref.rollout.multi_turn.enable=True`；
+- 自定义 Agent loop：`multi_task_agent_loop.py`；
+- 自定义奖励：`cpr_reward.py`；
+- 多任务数据集：`multi_task_dataset.py`。
+
+## 当前实现状态
+
+已完成：
+
+- 分类、检测、交互式分割与复合任务的统一 Agent loop；
+- Grounding DINO、BioMedCLIP、IMISNet/MedSAM2 三类后端 API；
+- 六数据集、五模态以及 CT/MR `3D → 2D` 数据处理脚本；
+- 从分割标注自动派生 bbox、类别与多任务 SFT 轨迹；
+- CPR v2 的终局质量、事件增益、协同、策略/格式、动作成本与规则式安全项；
+- CPR v2 与奖励信息透传的局部测试。
+
+尚待正式实验验证：
+
+- 含 Ray、模型权重与三类工具服务的完整 GRPO 端到端稳定训练；
+- CPR v2 相对终局奖励的稳定性能增益、消融、跨数据集泛化与安全性结论；
+- 学习式 Clinical Judge 及医生一致性评价。
+
+因此，请勿将当前仓库表述为已完成大规模 GRPO 收敛或已获得稳定性能提升的最终系统。
+
+## 文档导航
+
+- [`docs/PROJECT_INNOVATIONS.md`](docs/PROJECT_INNOVATIONS.md)：项目贡献边界、CPR v2 公式、实现状态与实验建议；
+- [`PLAN_MULTIAGENT.md`](PLAN_MULTIAGENT.md)：多任务数据、后端服务、SFT/GRPO 实施流程；
+- [`docs/CPR_REWARD_DESIGN.md`](docs/CPR_REWARD_DESIGN.md)：早期 CPR 概念设计与后续扩展方向；
+- [`docs/INTERVIEW_QA.md`](docs/INTERVIEW_QA.md)：基于当前实现状态的面试问答口径；
+- [`docs/RESUME_PROJECT.md`](docs/RESUME_PROJECT.md)：简历项目描述模板。
+
+## Acknowledgements
+
+本项目建立在以下开源工作之上：
+
+- [MedSAM-Agent](https://arxiv.org/abs/2602.03320)
+- [verl](https://github.com/verl-project/verl)
+- [LlamaFactory](https://github.com/hiyouga/LlamaFactory)
+- [Grounding DINO](https://github.com/IDEA-Research/GroundingDINO)
+- [BioMedCLIP](https://huggingface.co/microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224)
 - [MedSAM2](https://medsam2.github.io/)
 - [IMISNet](https://github.com/uni-medical/IMIS-Bench)
-- [UniBioMed](https://github.com/Luffy03/UniBiomed)
-- [BioMedParse](https://github.com/microsoft/BiomedParse)
-- [SegAgent](https://github.com/aim-uofa/SegAgent)
-
-## 📜Citation
-If you find this work helpful for your project, please consider citing our paper.
-```
-@misc{liu2026medsamagentempoweringinteractivemedical,
-      title={MedSAM-Agent: Empowering Interactive Medical Image Segmentation with Multi-turn Agentic Reinforcement Learning}, 
-      author={Shengyuan Liu and Liuxin Bao and Qi Yang and Wanting Geng and Boyun Zheng and Chenxin Li and Wenting Chen and Houwen Peng and Yixuan Yuan},
-      year={2026},
-      eprint={2602.03320},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2602.03320}, 
-}
-```
-

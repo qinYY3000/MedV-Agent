@@ -1,7 +1,7 @@
 # VLM 多任务视觉 Agent 实施方案
 
 > 基于 MedSAM-Agent 框架，以高精度病灶分割为目标，利用筛查分类、检测定位和 ROI 表征形成临床闭环
-> 支持 6 个数据集、4 种模态（超声/X-ray/CT/MR）、5 个解剖部位
+> 支持 6 个数据集、5 种模态（超声/内镜/X-ray/CT/MR）、5 个解剖部位
 
 ---
 
@@ -58,7 +58,7 @@ Step 2: RL 数据 (parquet 格式, Verl 要求)
 ### 3.1 整体架构
 
 ```
-Agent (Qwen3-VL-8B)
+Agent（Qwen-VL 系列；当前快速验证配置为 Qwen3.5-4B）
     │
     ├── triage classify → BioMedCLIP API (:8267) [全图筛查]
     ├── detect          → Grounding DINO API (:8266) [候选定位]
@@ -217,7 +217,7 @@ llamafactory-cli train /mnt/workspace/MedSAM-Agent/data/sft_data/sft_train_4b.ya
 | 全量 | 100000 | 3 | ~6-8h | 正式训练 |
 
 **断点续训**:
-- checkpoint 每 500 步自动保存到 `saves/qwen3-vl-8b/lora/sft/checkpoint-XXX/`
+- checkpoint 每 500 步自动保存到对应模型的 LoRA 输出目录，例如 `saves/qwen3.5-4b/lora/sft/checkpoint-XXX/`
 - 分词缓存 (.arrow) 在 `~/.cache/huggingface/datasets/` 下，实例重启后保留
 - 下次训练时用 `--resume_from_checkpoint` 从上次 checkpoint 继续，跳过分词阶段
 
@@ -249,9 +249,10 @@ cd /mnt/workspace/MedSAM-Agent && python data/eval_sft.py \
 **上传模型到 ModelScope**:
 ```bash
 # 将 SFT 合并后的模型上传到 ModelScope
+# 通过环境变量提供访问令牌，避免将敏感信息写入文档或仓库
 modelscope upload ScholarChen20/Qwen3.5-4B \
     /mnt/workspace/LlamaFactory/saves/qwen3.5_sft_merged \
-    --token ms-7df9fd49-9a59-495d-bf50-f2922001f367xxx112g
+    --token "$MODELSCOPE_TOKEN"
 ```
 
 ### Phase 3: RL 训练 (GRPO)
@@ -276,20 +277,19 @@ pip install -e ".[sglang]" --no-build-isolation
 #### Step 3.3: 启动 RL 训练
 
 ```bash
-git clone https://github.com/Dao-AILab/flash-attention.git
-cd flash-attention
-MAX_JOBS=4 python setup.py install
-
+# ROCm 环境建议使用 SDPA；不要安装 CUDA 版 flash-attn
 cd /mnt/workspace/MedSAM-Agent
 bash RL-verl/recipe/medsam_agent/run_multi_task.sh
 ```
 
 **GRPO 核心配置**:
-- `algorithm.adv_estimator=grpo` (GRPO 算法)
-- `rollout.n=2` (每个 prompt 采样 2 条轨迹，子集模式)
-- `rollout.name=vllm` (推理引擎，AMD 用 vllm rocm 版)
-- `multi_turn.enable=True` (多轮工具调用，最多 3 轮)
-- `custom_reward_function.path=recipe/medsam_agent/cpr_reward.py` (CPR 奖励)
+- `algorithm.adv_estimator=grpo`：使用 GRPO 优化多轮工具策略；
+- `rollout.n=2`：每个 prompt 采样 2 条轨迹（子集验证配置，可按显存调整）；
+- `rollout.name=vllm`：使用与 ROCm/PyTorch 匹配的 vLLM 版本；
+- `multi_turn.enable=True`：开启多轮工具调用；
+- `custom_reward_function.path=recipe/medsam_agent/cpr_reward.py`：启用规则版 CPR v2。
+
+CPR v2 在终局质量之外，计算事件级状态增益、筛查→检测/检测→分割/分割→ROI 分类的信息流协同、任务条件化策略与格式、动作成本和规则式安全惩罚。当前已完成局部测试；完整 GRPO 收敛、终局性能增益与消融结论仍待正式实验验证。
 
 ### Phase 4: 评估
 

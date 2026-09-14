@@ -79,13 +79,17 @@ def scan_busi(busi_root: str, train_ratio=0.7, val_ratio=0.15, seed=42) -> Dict[
         for sid, data in sample_dict.items():
             if data["image"] is None:
                 continue
-            # 合并多 mask
-            mask_path = data["masks"][0] if data["masks"] else None
+            sample_id = f"busi::{sid}"
+            instances = _build_mask_instances(data["masks"], class_name, sample_id)
+            primary_instance = instances[0] if instances else None
             samples.append({
                 "image_path": data["image"],
-                "mask_path": mask_path,
+                # 兼容既有单目标轨迹；全部实例保存在 instances 中。
+                "mask_path": primary_instance["mask_path"] if primary_instance else None,
+                "bbox": primary_instance["bbox"] if primary_instance else None,
+                "instances": instances,
                 "label": class_name,
-                "sample_id": sid,
+                "sample_id": sample_id,
             })
     
     print(f"BUSI: {len(samples)} samples")
@@ -113,17 +117,20 @@ def scan_kvasir(kvasir_root: str, train_ratio=0.7, val_ratio=0.15, seed=42) -> D
         if not mask_path.exists():
             continue
         
-        # 读取 bbox
+        # 读取全部 bbox，避免多息肉图像只保留第一个实例。
         bi = bbox_data.get(sid, {})
         bboxes = bi.get("bbox", [])
-        bbox = [int(bboxes[0]["xmin"]), int(bboxes[0]["ymin"]), int(bboxes[0]["xmax"]), int(bboxes[0]["ymax"])] if bboxes else None
+        sample_id = f"kvasir::{sid}"
+        instances = _build_bbox_instances(bboxes, "polyp", sample_id, str(mask_path))
+        primary_instance = instances[0] if instances else None
         
         samples.append({
             "image_path": str(img_file),
             "mask_path": str(mask_path),
-            "bbox": bbox,
+            "bbox": primary_instance["bbox"] if primary_instance else None,
+            "instances": instances,
             "label": "polyp",
-            "sample_id": sid,
+            "sample_id": sample_id,
         })
     
     print(f"Kvasir-SEG: {len(samples)} samples")
@@ -315,6 +322,34 @@ def _bbox_from_mask(mask_path: str):
         return [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
     except Exception:
         return None
+
+
+def _build_mask_instances(mask_paths: list[str], label: str, sample_id: str) -> list[dict]:
+    """保留同图全部 mask，供单实例轨迹展开与后续多实例训练使用。"""
+    instances = []
+    for index, mask_path in enumerate(sorted(mask_paths)):
+        instances.append({
+            "instance_id": f"{sample_id}::{index}",
+            "label": label,
+            "mask_path": str(Path(mask_path).resolve()),
+            "bbox": _bbox_from_mask(mask_path),
+            "mask_scope": "instance",
+        })
+    return instances
+
+
+def _build_bbox_instances(bboxes: list[dict], label: str, sample_id: str, mask_path: str) -> list[dict]:
+    """保留全部检测框；Kvasir 图级 mask 显式标为 semantic_union。"""
+    return [
+        {
+            "instance_id": f"{sample_id}::{index}",
+            "label": label,
+            "mask_path": str(Path(mask_path).resolve()),
+            "bbox": [int(box["xmin"]), int(box["ymin"]), int(box["xmax"]), int(box["ymax"])],
+            "mask_scope": "semantic_union",
+        }
+        for index, box in enumerate(bboxes)
+    ]
 
 
 def _split(samples, train_ratio=0.7, val_ratio=0.15, seed=42):
@@ -581,57 +616,71 @@ def generate_sharegpt(samples, output_dir, dataset_name, max_clicks=2,
             print(f"       -> {image_map[sample_key]}")
     
     for sample in samples:
-        sid = sample["sample_id"]
+        sample_id = sample["sample_id"]
         label = sample["label"]
         img_path = sample["image_path"]
-        mask_path = sample.get("mask_path")
-        bbox = sample.get("bbox")
-        
         img_rel = image_map[img_path]
-        
+        # 只有独立实例 mask 才能安全展开为逐实例分割轨迹。图级语义 mask
+        # （如 Kvasir 的 semantic_union）仍保持单条兼容轨迹，避免伪造实例 GT。
+        instance_samples = [
+            instance for instance in sample.get("instances", [])
+            if instance.get("mask_scope", "instance") == "instance"
+        ]
+        if not instance_samples:
+            instance_samples = [{
+                "instance_id": sample_id,
+                "label": label,
+                "mask_path": sample.get("mask_path"),
+                "bbox": sample.get("bbox"),
+            }]
+
         for task_type in ["classify", "detect", "segment", "composite"]:
-            if label == "normal" and task_type in ("segment", "composite"):
-                continue
-            if not mask_path and task_type in ("segment", "composite"):
-                continue
-            
-            try:
-                if task_type == "classify":
-                    conv = build_classify(img_path, label)
-                elif task_type == "detect":
-                    conv = build_detect(img_path, bbox, label)
-                elif task_type == "segment":
-                    conv = build_segment(img_path, mask_path, max_clicks, label)
-                elif task_type == "composite":
-                    conv = build_composite(img_path, mask_path, label, bbox)
-                else:
+            task_instances = instance_samples if task_type in {"segment", "composite"} else instance_samples[:1]
+            for instance in task_instances:
+                instance_id = instance["instance_id"]
+                instance_label = instance.get("label", label)
+                mask_path = instance.get("mask_path")
+                bbox = instance.get("bbox")
+                if instance_label == "normal" and task_type in ("segment", "composite"):
                     continue
-                
-                if conv is None:
+                if not mask_path and task_type in ("segment", "composite"):
                     continue
-                
-                # sharegpt 格式: value 里保留 "<image>" 占位符，images 字段写路径
-                # LlamaFactory 会自动把 <image> 替换为 images 中的实际图片
-                # system prompt 单独放 system 字段, 不放在 conversations 里
-                conversations = []
-                for m in conv:
-                    new_value = m["value"]
-                    # 第一条 human 消息保留 <image>，后续 human 消息确保没有多余的 <image>
-                    if m["from"] == "human" and conversations and "<image>" in new_value:
-                        new_value = new_value.replace("<image>", "")
-                    conversations.append({"from": m["from"], "value": new_value})
-                
-                entries.append({
-                    "conversations": conversations,
-                    "images": [img_rel],
-                    "system": SYSTEM_PROMPT,
-                    # 额外信息（可选）
-                    "_sample_id": sid,
-                    "_task_type": task_type,
-                    "_label": label,
-                })
-            except Exception as e:
-                print(f"    Error {task_type} {sid}: {e}")
+
+                try:
+                    if task_type == "classify":
+                        conv = build_classify(img_path, instance_label)
+                    elif task_type == "detect":
+                        conv = build_detect(img_path, bbox, instance_label)
+                    elif task_type == "segment":
+                        conv = build_segment(img_path, mask_path, max_clicks, instance_label)
+                    elif task_type == "composite":
+                        conv = build_composite(img_path, mask_path, instance_label, bbox)
+                    else:
+                        continue
+
+                    if conv is None:
+                        continue
+
+                    # sharegpt 格式: value 里保留 "<image>" 占位符，images 字段写路径
+                    # LlamaFactory 会自动把 <image> 替换为 images 中的实际图片
+                    conversations = []
+                    for m in conv:
+                        new_value = m["value"]
+                        if m["from"] == "human" and conversations and "<image>" in new_value:
+                            new_value = new_value.replace("<image>", "")
+                        conversations.append({"from": m["from"], "value": new_value})
+
+                    entries.append({
+                        "conversations": conversations,
+                        "images": [img_rel],
+                        "system": SYSTEM_PROMPT,
+                        "_sample_id": sample_id,
+                        "_instance_id": instance_id,
+                        "_task_type": task_type,
+                        "_label": instance_label,
+                    })
+                except Exception as e:
+                    print(f"    Error {task_type} {instance_id}: {e}")
     
     # ---- 按模态均衡下采样 ----
     if (max_per_task is not None and max_per_task > 0) or per_modality > 0:
