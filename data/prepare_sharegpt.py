@@ -46,6 +46,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from data.ultrasound_datasets import scan_group_breast, scan_szu_bch_tus
+
 
 # ============================================================
 # 1. 数据扫描
@@ -395,6 +397,7 @@ SYSTEM_PROMPT = """You are a professional medical image analysis agent specializ
 - detect: Detect all instances of a target object
 - add_bbox: Initialize segmentation with a bounding box
 - add_point: Refine segmentation with a positive/negative point
+- finish_instance: Mark one segmented candidate complete while continuing with other candidates
 - stop_action: Finish the task and output the final result
 
 # Tool Call Format
@@ -425,6 +428,7 @@ Assistant: <tool_call>
 - Always use <tool_call> format, NEVER use ```json format
 - For segmentation: add_bbox first, then add_point to refine, then stop
 - For composite tasks: first classify the whole image for triage. If suspicious, use classify->detect->add_bbox->add_point->ROI classify->stop
+- For multiple detected instances: complete every candidate with finish_instance before stop_action
 - Call one tool per turn"""
 
 
@@ -562,6 +566,53 @@ def build_composite(image_path, mask_path, label, bbox=None):
     ]
 
 
+def build_multi_instance_composite(image_path, instances):
+    """生成同一图像逐实例检测、分割、完成并最终停止的专家轨迹。"""
+    prepared_instances = []
+    for index, instance in enumerate(instances):
+        mask_path = instance.get("mask_path")
+        if not mask_path:
+            continue
+        mask = Image.open(mask_path).convert("L")
+        binary = np.array(mask) > 127
+        if not binary.any():
+            continue
+        ys, xs = np.where(binary)
+        width, height = mask.size
+        bbox = [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
+        bbox_999 = [int(value * 999 / width) for value in bbox[::2]]
+        bbox_999 = [bbox_999[0], int(bbox[1] * 999 / height), bbox_999[1], int(bbox[3] * 999 / height)]
+        center = [int(np.median(xs) * 999 / width), int(np.median(ys) * 999 / height)]
+        prepared_instances.append({
+            "instance_id": f"candidate_{index}",
+            "label": instance.get("label", "lesion"),
+            "bbox": bbox_999,
+            "center": center,
+        })
+
+    if len(prepared_instances) < 2:
+        return None
+
+    target = prepared_instances[0]["label"].replace("_", " ")
+    messages = [
+        {"from": "human", "value": f"<image>Find and segment every {target} in this image."},
+        {"from": "gpt", "value": tc("detect", {"target": target})},
+        {"from": "human", "value": f"Detected candidates: {prepared_instances}"},
+    ]
+    for instance in prepared_instances:
+        instance_id = instance["instance_id"]
+        messages.extend([
+            {"from": "gpt", "value": tc("add_bbox", {"instance_id": instance_id, "bbox_2d": instance["bbox"]})},
+            {"from": "human", "value": f"Mask initialized for {instance_id}. What is your next action?"},
+            {"from": "gpt", "value": tc("add_point", {"instance_id": instance_id, "point_2d": instance["center"], "point_type": "positive"})},
+            {"from": "human", "value": f"Mask refined for {instance_id}. What is your next action?"},
+            {"from": "gpt", "value": tc("finish_instance", {"instance_id": instance_id})},
+            {"from": "human", "value": f"Finished {instance_id}. Continue with remaining candidates."},
+        ])
+    messages.append({"from": "gpt", "value": tc("stop_action", {})})
+    return messages
+
+
 # ============================================================
 # 3. 生成 sharegpt 数据集
 # ============================================================
@@ -681,6 +732,22 @@ def generate_sharegpt(samples, output_dir, dataset_name, max_clicks=2,
                     })
                 except Exception as e:
                     print(f"    Error {task_type} {instance_id}: {e}")
+
+        # 稀有多病灶图额外生成一条图像级多实例轨迹；保留原单实例轨迹作为主干。
+        multi_instance_conversation = build_multi_instance_composite(
+            img_path,
+            [instance for instance in sample.get("instances", []) if instance.get("mask_scope", "instance") == "instance"],
+        )
+        if multi_instance_conversation is not None:
+            entries.append({
+                "conversations": multi_instance_conversation,
+                "images": [img_rel],
+                "system": SYSTEM_PROMPT,
+                "_sample_id": sample_id,
+                "_instance_id": "all",
+                "_task_type": "multi_instance_composite",
+                "_label": label,
+            })
     
     # ---- 按模态均衡下采样 ----
     if (max_per_task is not None and max_per_task > 0) or per_modality > 0:
@@ -769,8 +836,17 @@ DATASET_INFO = {
 
 
 # ============================================================
-# 5. 主函数
+# 5. 输出与主函数
 # ============================================================
+
+def write_sft_split(output_dir: Path, split: str, entries: list[dict]) -> Path:
+    """分别写出训练/验证/测试 SFT 数据，避免验证和测试样本泄漏进训练主文件。"""
+    suffix = "" if split == "train" else f"_{split}"
+    output_path = output_dir / f"medsam_agent_sft{suffix}.json"
+    with open(output_path, "w", encoding="utf-8") as file:
+        json.dump(entries, file, ensure_ascii=False)
+    return output_path
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -792,6 +868,8 @@ def main():
                              "e.g. 'E:/data' will be replaced by --server-root")
     parser.add_argument("--max-clicks", type=int, default=2,
                         help="Max segment refinement turns")
+    parser.add_argument("--group-breast-max-frames", type=int, default=1000,
+                        help="Group Breast 均衡抽取的有效标注帧数，默认 1000")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-per-task", type=int, default=1200,
                         help="Max entries per task type (0=no limit). "
@@ -834,6 +912,12 @@ def main():
             splits = scan_abdomen_2d(src_root, "abdct", seed=args.seed)
         elif src_type in ("abdmr", "abdmr_2d"):
             splits = scan_abdomen_2d(src_root, "abdmr", seed=args.seed)
+        elif src_type == "group_breast":
+            splits = scan_group_breast(
+                src_root, max_frames=args.group_breast_max_frames, seed=args.seed
+            )
+        elif src_type in ("szu_bch_tus", "szu_bch_tus983", "szu"):
+            splits = scan_szu_bch_tus(src_root, seed=args.seed)
         else:
             print(f"  Unknown source type: {src_type}, skip")
             continue
@@ -858,23 +942,8 @@ def main():
             per_modality=args.per_modality,
         )
         
-        out_path = output_dir / f"medsam_agent_sft.json"
-        
-        # 如果是第一次写，直接写；否则追加
-        if split == "train":
-            all_entries = entries
-        else:
-            # 读已有 + 追加
-            if out_path.exists():
-                with open(out_path) as f:
-                    all_entries = json.load(f)
-            else:
-                all_entries = []
-            all_entries.extend(entries)
-        
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(all_entries, f, ensure_ascii=False)
-        
+        out_path = write_sft_split(output_dir, split, entries)
+
         task_counts = defaultdict(int)
         for e in entries:
             task_counts.get(e.get("_task_type", "unknown"), 0)

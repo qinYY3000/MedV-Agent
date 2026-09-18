@@ -115,13 +115,17 @@ pip install nibabel
 python data/extract_3d_slices.py --input-dir data/datasets/abdct --output-dir data/datasets/abdct_2d --slices-per-volume 5
 python data/extract_3d_slices.py --input-dir data/datasets/abdmr --output-dir data/datasets/abdmr_2d --slices-per-volume 5
 
-# 当前多病灶实验范围：BUSI、Kvasir-SEG、TN3K。
-# COVID-19、AbdomenCT、AbdomenMR 暂不纳入本轮 SFT/RL 与评估。
+# 当前超声扩展范围：BUSI、Group Breast、TN3K、SZU-BCH-TUS983。
+# Group Breast 从有效实例标注帧中按视频序列均衡选择 1000 张。
 cd /mnt/workspace/MedSAM-Agent
 python data/prepare_sharegpt.py \
     --source busi data/Dataset_BUSI_with_GT \
-    --source kvasir data/kvasir-seg \
+    --source group_breast data/group_breast \
     --source tn3k data/tn3k \
+    --source szu_bch_tus data/SZU-BCH-TUS983 \
+    --group-breast-max-frames 1000 \
+    --max-per-task 0 \
+    --per-modality 0 \
     --output data/sft_data \
     --llamafactory-dir /mnt/workspace/LlamaFactory
 ```
@@ -129,19 +133,21 @@ python data/prepare_sharegpt.py \
 #### Step 1.2: RL 数据生成 (parquet)
 
 ```bash
-# 当前多病灶实验范围：BUSI、Kvasir-SEG、TN3K。
-# COVID-19、AbdomenCT、AbdomenMR 暂不纳入本轮 SFT/RL 与评估。
-# 1. 扫描 3 个 2D 数据集 → parquet
+# 当前超声扩展范围：BUSI、Group Breast、TN3K、SZU-BCH-TUS983。
+# Group Breast 从有效实例标注帧中按视频序列均衡选择 1000 张。
+# 1. 扫描 4 个超声数据集 → parquet
 python data/prepare_all_datasets.py \
     --busi data/Dataset_BUSI_with_GT \
-    --kvasir data/kvasir-seg \
+    --group-breast data/group_breast \
+    --group-breast-max-frames 1000 \
     --tn3k data/tn3k \
+    --szu-bch-tus data/SZU-BCH-TUS983 \
     --output data/datasets
 
-# 2. 仅合并本轮选定数据集；不要自动混入历史 X-ray、CT、MR parquet。
+# 2. 仅合并本轮选定数据集；不要自动混入历史内镜、X-ray、CT、MR parquet。
 python data/combine_parquet.py \
     --datasets-dir data/datasets \
-    --include busi kvasir tn3k \
+    --include busi group_breast tn3k szu_bch_tus \
     --output data/datasets/combined
 ```
 

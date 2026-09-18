@@ -29,6 +29,17 @@ def select_dataset_dirs(base: Path, include: list[str] | None = None) -> list[Pa
     )
 
 
+def concat_dataset_frames(dataframes: list[pd.DataFrame]) -> pd.DataFrame:
+    """统一可变元数据列类型后合并，避免 pyarrow 因跨数据集类型冲突失败。"""
+    normalized = []
+    for dataframe in dataframes:
+        frame = dataframe.copy()
+        if "frame_index" in frame.columns:
+            frame["frame_index"] = frame["frame_index"].astype("string")
+        normalized.append(frame)
+    return pd.concat(normalized, ignore_index=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Combine all dataset parquets")
     parser.add_argument("--datasets-dir", type=str, default="data/datasets",
@@ -55,7 +66,7 @@ def main():
                 all_dfs.append(df)
                 print(f"  {ds_dir.name}/{split}: {len(df)} samples")
         if all_dfs:
-            combined = pd.concat(all_dfs, ignore_index=True)
+            combined = concat_dataset_frames(all_dfs)
             out_path = output / f"{split}.parquet"
             combined.to_parquet(out_path, index=False)
             print(f"Combined {split}: {len(combined)} samples -> {out_path}\n")

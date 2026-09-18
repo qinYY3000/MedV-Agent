@@ -78,6 +78,9 @@ tools:
         parameters:
           type: "object"
           properties:
+            instance_id:
+              type: "string"
+              description: "Optional detected candidate ID. Required when multiple candidates are active."
             bbox_2d:
               type: "array"
               items:
@@ -105,6 +108,9 @@ tools:
         parameters:
           type: "object"
           properties:
+            instance_id:
+              type: "string"
+              description: "Optional detected candidate ID. Required when multiple candidates are active."
             point_2d:
               type: "array"
               items:
@@ -117,6 +123,23 @@ tools:
               enum: ["positive", "negative"]
               description: "'positive' to expand mask, 'negative' to refine mask"
           required: ["point_2d", "point_type"]
+
+  # ====== 实例级完成工具 ======
+  - class_name: "verl.tools.finish_instance_tool.FinishInstanceTool"
+    config:
+      type: native
+    tool_schema:
+      type: "function"
+      function:
+        name: "finish_instance"
+        description: "Finish the currently segmented candidate and continue analyzing other detected candidates."
+        parameters:
+          type: "object"
+          properties:
+            instance_id:
+              type: "string"
+              description: "Candidate ID to mark as finished."
+          required: ["instance_id"]
 
   # ====== 停止工具 ======
   - class_name: "verl.tools.medsam_unified_point_tools.StopActionTool"

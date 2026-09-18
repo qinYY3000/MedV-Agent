@@ -271,7 +271,8 @@ class MultiTaskDataset(RLHFDataset):
                     "type": "object",
                     "properties": {"bbox_2d": {"type": "array", "items": {"type": "integer"},
                                                 "minItems": 4, "maxItems": 4,
-                                                "description": "bbox [x1,y1,x2,y2] in 0-999"}},
+                                                "description": "bbox [x1,y1,x2,y2] in 0-999"},
+                        "instance_id": {"type": "string", "description": "Candidate ID for multi-instance segmentation"}},
                     "required": ["bbox_2d"]
                 }
             }},
@@ -284,14 +285,24 @@ class MultiTaskDataset(RLHFDataset):
                         "point_2d": {"type": "array", "items": {"type": "integer"},
                                       "minItems": 2, "maxItems": 2,
                                       "description": "point [x,y] in 0-999"},
-                        "point_type": {"type": "string", "enum": ["positive", "negative"]}
+                        "point_type": {"type": "string", "enum": ["positive", "negative"]},
+                        "instance_id": {"type": "string", "description": "Candidate ID for multi-instance segmentation"}
                     },
                     "required": ["point_2d", "point_type"]
                 }
             }},
             {"type": "function", "function": {
+                "name": "finish_instance",
+                "description": "Finish one segmented candidate while continuing to analyze other candidates.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"instance_id": {"type": "string", "description": "Candidate ID to finish"}},
+                    "required": ["instance_id"]
+                }
+            }},
+            {"type": "function", "function": {
                 "name": "stop_action",
-                "description": "Finish task and output final result.",
+                "description": "Finish task and output final result. For multiple candidates, call only after all instances are finished.",
                 "parameters": {"type": "object", "properties": {}, "required": []}
             }}
         ])

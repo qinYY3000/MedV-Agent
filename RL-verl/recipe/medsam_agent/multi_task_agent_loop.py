@@ -14,6 +14,8 @@ import asyncio
 import json
 import logging
 import os
+import sys
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -23,6 +25,13 @@ from verl.experimental.agent_loop import ToolAgentLoop
 from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
 from verl.tools.schemas import ToolResponse
 from qwen_vl_utils import process_vision_info
+
+_RECIPE_DIR = Path(__file__).resolve().parent
+if str(_RECIPE_DIR) not in sys.path:
+    sys.path.insert(0, str(_RECIPE_DIR))
+from multi_instance_state import MultiInstanceState
+
+SEGMENT_TOOLS = {"add_bbox", "add_point"}
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -46,6 +55,8 @@ class MultiTaskAgentLoop(ToolAgentLoop):
         self._detection_results = []
         self._classification_results = []
         self._tool_trace = []
+        self._multi_instance_state = MultiInstanceState()
+        self._segmentation_sessions = {}
 
     # ========== 生命周期 ==========
 
@@ -57,6 +68,8 @@ class MultiTaskAgentLoop(ToolAgentLoop):
         self._detection_results = []
         self._classification_results = []
         self._tool_trace = []
+        self._multi_instance_state.reset()
+        self._segmentation_sessions = {}
 
         original_image_data = kwargs.get("multi_modal_data", {}).get("image", None)
         if isinstance(original_image_data, list) and len(original_image_data) > 0:
@@ -79,6 +92,7 @@ class MultiTaskAgentLoop(ToolAgentLoop):
             else:
                 output.extra_fields["pred_mask"] = []
 
+            output.extra_fields["pred_instances"] = self._multi_instance_state.pred_instances()
             output.extra_fields["detection_boxes"] = self._detection_results
             output.extra_fields["classification_result"] = (
                 self._classification_results[-1] if self._classification_results else {}
@@ -98,6 +112,18 @@ class MultiTaskAgentLoop(ToolAgentLoop):
     async def _cleanup(self):
         """释放所有资源。"""
         import torch, gc
+        for candidate_id, session in list(self._segmentation_sessions.items()):
+            try:
+                owner = self.tools.get(session["owner"])
+                if owner is not None:
+                    await owner.release(session["session_id"])
+                for segment_tool_name in SEGMENT_TOOLS:
+                    segment_tool = self.tools.get(segment_tool_name)
+                    if segment_tool is not None:
+                        segment_tool.detach_instance_state(session["session_id"])
+            except Exception as e:
+                logger.warning(f"Cleanup error for segmentation instance {candidate_id}: {e}")
+        self._segmentation_sessions.clear()
         for tool_name, instance_id in list(self._persistent_instances.items()):
             try:
                 if instance_id and tool_name in self.tools:
@@ -124,22 +150,18 @@ class MultiTaskAgentLoop(ToolAgentLoop):
     # ========== 工具执行管理 ==========
 
     async def _execute_single_tool_call(self, tool_call, tools_kwargs):
-        """执行单个工具调用，管理持久化实例。"""
-        import json as json_mod
+        """执行单个工具调用，并为分割工具路由独立的候选实例 session。"""
         tool_name = tool_call.name
-        tool_args = {}
-        try:
-            tool_args = json_mod.loads(tool_call.arguments)
-        except Exception:
-            pass
+        tool_args = self._parse_tool_arguments(tool_call)
 
         if tool_name not in self.tools:
             return ToolResponse(text=f"Error: unknown tool '{tool_name}'"), -0.1, {}
 
+        if tool_name in SEGMENT_TOOLS:
+            return await self._execute_segmentation_tool(tool_name, tool_args, tools_kwargs)
+
         tool = self.tools[tool_name]
         kwargs = tools_kwargs.get(tool_name, {})
-
-        # 持久化实例
         if tool_name in self._persistent_instances:
             instance_id = self._persistent_instances[tool_name]
         else:
@@ -150,6 +172,40 @@ class MultiTaskAgentLoop(ToolAgentLoop):
 
         response, reward, res = await tool.execute(instance_id, tool_args)
         return response, reward, res
+
+    async def _execute_segmentation_tool(self, tool_name, tool_args, tools_kwargs):
+        """为每个候选病灶创建并复用独立的分割 API session。"""
+        requested_id = tool_args.pop("instance_id", None)
+        candidate_id = self._multi_instance_state.resolve(requested_id)
+        if candidate_id is None and tool_name == "add_bbox" and requested_id is None:
+            bbox = tool_args.get("bbox_2d", [])
+            created = self._multi_instance_state.register_detections([{"bbox": bbox, "label": "implicit_target"}])
+            candidate_id = created[0] if created else None
+        if candidate_id is None:
+            return ToolResponse(text="Error: provide a valid instance_id for this segmentation action."), -0.1, {"success": False}
+
+        tool = self.tools[tool_name]
+        session = self._segmentation_sessions.get(candidate_id)
+        if session is None:
+            if tool_name != "add_bbox":
+                return ToolResponse(text="Error: initialize this instance with add_bbox before add_point."), -0.1, {"success": False}
+            kwargs = tools_kwargs.get(tool_name, {})
+            session_id = f"{self._episode_id}_segment_{candidate_id}"
+            session_id, _ = await tool.create(
+                instance_id=session_id,
+                create_kwargs=kwargs.get("create_kwargs", {}),
+            )
+            session = {"session_id": session_id, "owner": tool_name, "state": tool.get_instance_state(session_id)}
+            self._segmentation_sessions[candidate_id] = session
+        else:
+            tool.attach_instance_state(session["session_id"], session["state"])
+
+        response, reward, result = await tool.execute(session["session_id"], tool_args)
+        session["state"] = tool.get_instance_state(session["session_id"])
+        if isinstance(result, dict):
+            result = dict(result)
+            result["instance_id"] = candidate_id
+        return response, reward, result
 
     @staticmethod
     def _parse_tool_arguments(tool_call):
@@ -179,9 +235,28 @@ class MultiTaskAgentLoop(ToolAgentLoop):
         import asyncio as aio
         from verl.experimental.agent_loop.tool_agent_loop import AgentState
 
-        # 检查 stop_action
+        # stop_action 是图像级停止：存在未完成候选时拒绝停止并要求继续处理。
         is_stop = any(tc.name == "stop_action" for tc in agent_data.tool_calls)
         if is_stop:
+            pending_ids = self._multi_instance_state.pending_ids()
+            if pending_ids:
+                self._tool_trace.append({
+                    "turn": len(self._tool_trace) + 1,
+                    "tool": "stop_action",
+                    "arguments": {},
+                    "success": False,
+                    "result": {"stop": False, "pending_instances": pending_ids},
+                    "mask_before": self._latest_mask,
+                    "mask_after": self._latest_mask,
+                    "tool_reward": -0.1,
+                })
+                return await self._append_user_message(agent_data, {
+                    "role": "user",
+                    "content": [{"type": "text", "text": (
+                        f"Cannot stop yet. Pending instances: {pending_ids}. "
+                        "Segment and finish every pending instance before stop_action."
+                    )}],
+                })
             for tool_call in agent_data.tool_calls:
                 if tool_call.name == "stop_action":
                     self._tool_trace.append({
@@ -223,15 +298,25 @@ class MultiTaskAgentLoop(ToolAgentLoop):
                 result_data.update(res)
 
             event_result = dict(res) if isinstance(res, dict) else {}
+            tool_arguments = self._parse_tool_arguments(tool_call)
+            instance_id = event_result.get("instance_id") or tool_arguments.get("instance_id")
+            mask_before = self._multi_instance_state.current_mask(instance_id) if tool_call.name in SEGMENT_TOOLS else None
+            if tool_call.name in SEGMENT_TOOLS:
+                self._multi_instance_state.record_mask(instance_id, response_mask)
+            if tool_call.name == "finish_instance":
+                event_result["finished"] = self._multi_instance_state.finish(instance_id)
             event_success = event_result.get("success", not (resp.text or "").startswith("Error:"))
+            if tool_call.name == "finish_instance":
+                event_success = bool(event_success and event_result["finished"])
             self._tool_trace.append({
                 "turn": len(self._tool_trace) + 1,
                 "tool": tool_call.name,
-                "arguments": self._parse_tool_arguments(tool_call),
+                "arguments": tool_arguments,
                 "success": bool(event_success),
                 "result": event_result,
-                "mask_before": self._latest_mask if tool_call.name in ("add_bbox", "add_point") else None,
-                "mask_after": response_mask if tool_call.name in ("add_bbox", "add_point") else None,
+                "instance_id": instance_id,
+                "mask_before": mask_before,
+                "mask_after": response_mask if tool_call.name in SEGMENT_TOOLS else None,
                 "tool_reward": float(reward or 0.0),
             })
 
@@ -239,12 +324,23 @@ class MultiTaskAgentLoop(ToolAgentLoop):
 
         # 保存结果
         if tool_name == "detect" and "boxes" in result_data:
+            candidate_ids = self._multi_instance_state.register_detections(result_data["boxes"])
+            annotated_boxes = []
+            for box, candidate_id in zip(result_data["boxes"], candidate_ids, strict=False):
+                annotated_box = dict(box)
+                annotated_box["instance_id"] = candidate_id
+                annotated_boxes.append(annotated_box)
+            result_data["boxes"] = annotated_boxes
+            if self._tool_trace:
+                self._tool_trace[-1]["result"]["boxes"] = annotated_boxes
             self._detection_results.append({
                 "tool": tool_name,
-                "boxes": result_data["boxes"]
+                "boxes": annotated_boxes,
             })
         elif tool_name == "classify":
             self._classification_results.append(result_data)
+            if self._tool_trace and self._tool_trace[-1].get("instance_id"):
+                self._multi_instance_state.record_classification(self._tool_trace[-1]["instance_id"], result_data)
 
         # === 根据工具类型构造不同的反馈 ===
 
@@ -276,12 +372,25 @@ class MultiTaskAgentLoop(ToolAgentLoop):
                 boxes=result_data.get("boxes"),
                 boxes_normalized=True,
             )
+            pending_ids = self._multi_instance_state.pending_ids()
             user_msg = {
                 "role": "user",
                 "content": [
                     {"type": "image", "image": overlay},
-                    {"type": "text", "text": f"{response_text}\nWhat is your next action?"}
+                    {"type": "text", "text": (
+                        f"{response_text}\nDetected candidates: {result_data.get('boxes', [])}. "
+                        f"Process each candidate with its instance_id. Pending: {pending_ids}."
+                    )}
                 ]
+            }
+        elif tool_name == "finish_instance":
+            pending_ids = self._multi_instance_state.pending_ids()
+            user_msg = {
+                "role": "user",
+                "content": [{"type": "text", "text": (
+                    f"{response_text}\nFinished instance. Pending instances: {pending_ids}. "
+                    "Continue with another pending instance, or call stop_action only when all instances are complete."
+                )}],
             }
         else:
             # 未知工具: 文本反馈
@@ -290,9 +399,13 @@ class MultiTaskAgentLoop(ToolAgentLoop):
                 "content": [{"type": "text", "text": f"{response_text}\nWhat is your next action?"}]
             }
 
-        agent_data.messages.append(user_msg)
+        return await self._append_user_message(agent_data, user_msg)
 
-        # 重新编码整个对话
+    async def _append_user_message(self, agent_data, user_msg):
+        """追加工具观察并重新编码多轮对话。"""
+        from verl.experimental.agent_loop.tool_agent_loop import AgentState
+
+        agent_data.messages.append(user_msg)
         if self.processor is not None:
             raw = await self.loop.run_in_executor(
                 None, lambda: self.processor.apply_chat_template(
@@ -304,7 +417,6 @@ class MultiTaskAgentLoop(ToolAgentLoop):
                 imgs, vids = process_vision_info(agent_data.messages, image_patch_size=16)
             else:
                 imgs, vids = process_vision_info(agent_data.messages)
-
             agent_data.image_data = imgs if imgs else None
             inputs = self.processor(
                 text=[raw], images=imgs, videos=vids,
@@ -319,9 +431,7 @@ class MultiTaskAgentLoop(ToolAgentLoop):
                 agent_data.response_logprobs += [0.0] * delta
 
         agent_data.user_turns += 1
-        if len(agent_data.response_mask) >= self.response_length:
-            return AgentState.TERMINATED
-        return AgentState.GENERATING
+        return AgentState.TERMINATED if len(agent_data.response_mask) >= self.response_length else AgentState.GENERATING
 
     # ========== 辅助 ==========
 

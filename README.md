@@ -33,6 +33,8 @@
 
 复合任务并非固定流水线。Agent 可以根据任务类型及中间反馈决定是否继续调用工具、是否复用检测框或分割区域，以及何时停止。
 
+对于少量一图多病灶样本，数据层保留图像级 `instances[]`；检测工具会为多个候选框分配 `candidate_0`、`candidate_1` 等实例 ID。Agent 通过带 `instance_id` 的 `add_bbox` / `add_point` 维护独立分割 session，使用 `finish_instance` 结束当前病灶，并在全部候选完成后才调用 `stop_action`。单病灶仍沿用原有单目标流程。
+
 ### CPR v2：任务条件化临床过程奖励
 
 CPR v2 不只比较最终预测与真值，还将 Agent 轨迹表示为工具事件序列，联合评估：
@@ -86,11 +88,16 @@ pip install -r requirements.txt
 ### 2. 生成 SFT 数据
 
 ```bash
-# 当前多病灶实验范围：BUSI、Kvasir-SEG、TN3K。
+# 当前超声扩展范围：BUSI、Group Breast、TN3K、SZU-BCH-TUS983。
+# Group Breast 从有效实例标注帧中按视频序列均衡选择 1000 张。
 python data/prepare_sharegpt.py \
   --source busi data/Dataset_BUSI_with_GT \
-  --source kvasir data/kvasir-seg \
+  --source group_breast data/group_breast \
   --source tn3k data/tn3k \
+  --source szu_bch_tus data/SZU-BCH-TUS983 \
+  --group-breast-max-frames 1000 \
+  --max-per-task 0 \
+  --per-modality 0 \
   --output data/sft_data \
   --llamafactory-dir /mnt/workspace/LlamaFactory
 ```
@@ -102,18 +109,20 @@ SFT 轨迹包括：`classify → stop`、`detect → stop`、`add_bbox → add_p
 先生成四个原生 2D 数据集 parquet，再将 CT/MR 的 3D 数据转换为 2D 切片 parquet：
 
 ```bash
-# 当前多病灶实验范围：BUSI、Kvasir-SEG、TN3K。
-# COVID-19、AbdomenCT、AbdomenMR 暂不纳入本轮 SFT/RL 与评估。
+# 当前超声扩展范围：BUSI、Group Breast、TN3K、SZU-BCH-TUS983。
+# Group Breast 从有效实例标注帧中按视频序列均衡选择 1000 张。
 python data/prepare_all_datasets.py \
   --busi data/Dataset_BUSI_with_GT \
-  --kvasir data/kvasir-seg \
+  --group-breast data/group_breast \
+  --group-breast-max-frames 1000 \
   --tn3k data/tn3k \
+  --szu-bch-tus data/SZU-BCH-TUS983 \
   --output data/datasets
 
-# 必须使用 --include，避免历史的 X-ray、CT、MR parquet 被自动合入。
+# 必须使用 --include，避免历史的内镜、X-ray、CT、MR parquet 被自动合入。
 python data/combine_parquet.py \
   --datasets-dir data/datasets \
-  --include busi kvasir tn3k \
+  --include busi group_breast tn3k szu_bch_tus \
   --output data/datasets/combined
 ```
 

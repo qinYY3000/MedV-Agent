@@ -34,6 +34,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from data.ultrasound_datasets import scan_group_breast, scan_szu_bch_tus
+
 
 # ============================================================
 # 工具函数
@@ -119,6 +121,11 @@ def save_parquet(samples: list, output_path: str):
     df = pd.DataFrame(samples)
     df.to_parquet(output_path, index=False)
     print(f"  Saved {len(samples)} samples -> {output_path}")
+
+
+def should_write_combined(skip_combined: bool) -> bool:
+    """是否在当前预处理调用中重写 combined parquet。"""
+    return not skip_combined
 
 
 # ============================================================
@@ -417,8 +424,16 @@ Examples:
                         help="AbdomenCT 目录 (Dataset701_AbdomenCT, 含 NIfTI)")
     parser.add_argument("--abdmr", type=str, default=None,
                         help="AbdomenMR 目录 (Dataset702_AbdomenMR, 含 NIfTI)")
+    parser.add_argument("--group-breast", type=str, default=None,
+                        help="OminiRad Group Breast 视频帧目录（frames/masks_instances/reports）")
+    parser.add_argument("--group-breast-max-frames", type=int, default=1000,
+                        help="Group Breast 均衡抽取的有效标注帧数，默认 1000")
+    parser.add_argument("--szu-bch-tus", type=str, default=None,
+                        help="SZU-BCH-TUS983 目录（imagesTr/labelsTr/imagesTs/labelsTs）")
     parser.add_argument("--output", type=str, default="data/datasets",
                         help="Output directory for parquet files")
+    parser.add_argument("--skip-combined", action="store_true",
+                        help="Only write per-dataset parquet; keep an existing combined/ directory unchanged")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -431,12 +446,18 @@ Examples:
 
     # 数据集 → (路径参数, 扫描函数) 映射
     dataset_configs = [
-        ("busi",   args.busi,   scan_busi),
+        ("busi", args.busi, scan_busi),
         ("kvasir", args.kvasir, scan_kvasir),
-        ("covid",  args.covid,  scan_covid19),
-        ("tn3k",   args.tn3k,   scan_tn3k),
-        ("abdct",  args.abdct,  scan_abdomen_ct),
-        ("abdmr",  args.abdmr,  scan_abdomen_mr),
+        ("covid", args.covid, scan_covid19),
+        ("tn3k", args.tn3k, scan_tn3k),
+        ("abdct", args.abdct, scan_abdomen_ct),
+        ("abdmr", args.abdmr, scan_abdomen_mr),
+        (
+            "group_breast",
+            args.group_breast,
+            lambda path: scan_group_breast(path, max_frames=args.group_breast_max_frames, seed=args.seed),
+        ),
+        ("szu_bch_tus", args.szu_bch_tus, lambda path: scan_szu_bch_tus(path, seed=args.seed)),
     ]
 
     all_splits = {"train": [], "val": [], "test": []}
@@ -476,12 +497,15 @@ Examples:
         print(f"  {ds_name:10s}: train={stats['train']:5d}, val={stats['val']:4d}, test={stats['test']:4d}, total={stats['total']}")
     print(f"  {'TOTAL':10s}: train={len(all_splits['train']):5d}, val={len(all_splits['val']):4d}, test={len(all_splits['test']):4d}")
 
-    # 保存合并的 parquet
-    combined_dir = output_dir / "combined"
-    combined_dir.mkdir(parents=True, exist_ok=True)
-    for split in ["train", "val", "test"]:
-        if all_splits[split]:
-            save_parquet(all_splits[split], str(combined_dir / f"{split}.parquet"))
+    # 保存合并的 parquet；增量处理新数据集时避免覆盖已有 combined。
+    if should_write_combined(args.skip_combined):
+        combined_dir = output_dir / "combined"
+        combined_dir.mkdir(parents=True, exist_ok=True)
+        for split in ["train", "val", "test"]:
+            if all_splits[split]:
+                save_parquet(all_splits[split], str(combined_dir / f"{split}.parquet"))
+    else:
+        print("Skipped combined parquet generation; run combine_parquet.py after all selected datasets are ready.")
 
     # 保存统计信息
     stats_path = output_dir / "dataset_stats.json"
@@ -502,6 +526,8 @@ Examples:
             "tn3k": ("ultrasound", "thyroid", "thyroid_nodule"),
             "abdct": ("ct", "abdomen", "multi-organ (liver/kidney/spleen/pancreas...)"),
             "abdmr": ("mr", "abdomen", "multi-organ"),
+            "group_breast": ("ultrasound", "breast", "breast_lesion (instance masks)"),
+            "szu_bch_tus": ("ultrasound", "thyroid", "thyroid_nodule"),
         }
         for ds_name, stats in dataset_stats.items():
             mod, ana, lbl = ds_info.get(ds_name, ("?", "?", "?"))

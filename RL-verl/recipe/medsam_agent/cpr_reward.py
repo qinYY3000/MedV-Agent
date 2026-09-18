@@ -157,6 +157,39 @@ def summarize_instance_segmentation(
     }
 
 
+def compute_instance_terminal_quality(
+    predicted_masks: list[Any], ground_truth_masks: list[Any], min_iou: float = 0.5
+) -> dict:
+    """计算漏检敏感的实例级终局质量。
+
+    多病灶任务中优先保证实例召回，避免只分好最大病灶却漏掉其他目标时
+    仍获得过高奖励。
+    """
+    summary = summarize_instance_segmentation(predicted_masks, ground_truth_masks, min_iou=min_iou)
+    quality = (
+        0.45 * summary["instance_recall"]
+        + 0.35 * summary["mean_dice"]
+        + 0.20 * summary["instance_precision"]
+    )
+    summary["quality"] = float(_clip(quality))
+    return summary
+
+
+def _instance_masks(value: Any) -> list[Any]:
+    """从数据集或 rollout extra_info 中提取可用于实例匹配的 masks。"""
+    masks = []
+    for instance in _as_list(value):
+        instance = _unwrap(instance)
+        if not isinstance(instance, dict):
+            continue
+        mask = instance.get("mask")
+        if mask is None:
+            mask = instance.get("ground_truth_mask")
+        if mask is not None:
+            masks.append(mask)
+    return masks
+
+
 def compute_bbox_iou(box_a: list, box_b: list) -> float:
     if len(box_a) != 4 or len(box_b) != 4:
         return 0.0
@@ -665,6 +698,8 @@ def compute_score(
     image_size = _resolve_image_size(extra_info, gt_mask)
 
     pred_masks = _as_list(extra_info.get("pred_mask", []))
+    predicted_instance_masks = _instance_masks(extra_info.get("pred_instances", []))
+    ground_truth_instance_masks = _instance_masks(extra_info.get("ground_truth_instances", []))
     detection_boxes = _flatten_detection_boxes(extra_info.get("detection_boxes", []))
     classification_result = _classification_result(extra_info.get("classification_result", {}))
     tool_calls = extract_tool_calls(solution_str)
@@ -682,6 +717,16 @@ def compute_score(
         pred_masks[-1] if pred_masks else None,
     )
     segmentation_quality, final_iou, final_dice = _segmentation_quality(final_mask, gt_mask)
+    instance_metrics = None
+    if ground_truth_instance_masks:
+        # 旧单目标 rollout 没有 pred_instances 时，退回使用最终单 mask 进行实例匹配。
+        if not predicted_instance_masks and final_mask is not None:
+            predicted_instance_masks = [final_mask]
+        instance_metrics = compute_instance_terminal_quality(
+            predicted_instance_masks, ground_truth_instance_masks
+        )
+        if task_type in {"segment", "composite"}:
+            segmentation_quality = instance_metrics["quality"]
     detection_quality, normalized_detection_boxes = _detection_quality(
         detection_boxes, list(gt_bbox), gt_mask, image_size, gt_label
     )
@@ -750,6 +795,12 @@ def compute_score(
         gt_mask=gt_mask,
         gt_bbox=list(gt_bbox),
     )
+    if instance_metrics is not None:
+        missed_ratio = instance_metrics["missed_instance_count"] / max(1, len(ground_truth_instance_masks))
+        false_positive_ratio = instance_metrics["false_positive_instance_count"] / max(1, len(predicted_instance_masks))
+        safety["instance_miss"] = round(0.6 * missed_ratio, 4)
+        safety["instance_false_positive"] = round(0.2 * false_positive_ratio, 4)
+        safety["total"] = round(min(0.8, safety["total"] + safety["instance_miss"] + safety["instance_false_positive"]), 4)
 
     if task_type == "composite":
         raw_score = (
@@ -793,6 +844,7 @@ def compute_score(
         "terminal_quality": float(terminal_quality),
         "result_score": float(terminal_quality),
         "task_components": {key: float(value) for key, value in task_components.items()},
+        "instance_metrics": instance_metrics,
         "triage_quality": float(triage_quality),
         "roi_classification_quality": float(classification_quality),
         "process_score": float(process_score),

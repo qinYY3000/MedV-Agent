@@ -162,6 +162,18 @@ class MedSAMUnifiedToolBase(BaseTool):
         mask_pil = Image.open(io.BytesIO(img_bytes))
         return mask_pil
 
+    def get_instance_state(self, instance_id: str) -> Optional[dict]:
+        """返回 API session 的本地状态，供同一实例的 bbox/point 工具共享。"""
+        return self._instances.get(instance_id)
+
+    def attach_instance_state(self, instance_id: str, state: dict) -> None:
+        """附着已创建 session 的共享状态，不重新创建或重置 API session。"""
+        self._instances[instance_id] = state
+
+    def detach_instance_state(self, instance_id: str) -> None:
+        """仅移除本地引用；实际 API session 由创建者统一释放。"""
+        self._instances.pop(instance_id, None)
+
 
 class AddPointTool(MedSAMUnifiedToolBase):
     """Tool to add a point (positive or negative) to refine the segmentation mask."""
